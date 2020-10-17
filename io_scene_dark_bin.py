@@ -1,14 +1,16 @@
 bl_info = {
     "name": "Dark Engine Static Model",
     "author": "nemyax",
-    "version": (0, 4, 20201013.4), # Using YMD
+    "version": (0, 5, 20201017.6), # Using YMD
     "blender": (2, 83, 7),
     "location": "File > Import-Export",
     "description": "Import and export Dark Engine static model .bin",
     "warning": "inofficial version",
     "wiki_url": "https://sourceforge.net/p/blenderbitsbobs/wiki/Dark%20Engine%20model%20importer-exporter/",
     "tracker_url": "",
-    "category": "Import-Export"}
+    "category": "Import-Export"
+}
+
 
 # 2.8 Update info:
 # 20200710.1
@@ -538,7 +540,7 @@ def make_objects(object_data, file_path, options):
             if options['support_3ds_export']:
                 # Create axle for old school support
                 # XX must be replaced by parent but we don't have that info yet.
-                # TODO: Angles in Gon/4??? 
+                # TODO: Angles in Gon/4?
                 min = int(s.min / math.pi * 50) or "00"
                 max = int(s.max / math.pi * 50) or "00"
                 mesh = bpy.data.meshes.new(oldschool_char 
@@ -567,7 +569,6 @@ def make_objects(object_data, file_path, options):
                 vhot.empty_display_size = 0.075
             else:
                 # Create as a cube to for (future) 3ds to bin
-                # Could this be double digits?
                 vhot_name = "@h" + ("0" + str(v[0]) if v[0] < 10 else str(v[0])) + s.name
                 mesh = bpy.data.meshes.new(vhot_name)
                 vhot = bpy.data.objects.new(vhot_name, mesh)
@@ -670,6 +671,9 @@ def do_import(file_path, options):
 ### Export
 ###
 
+# Joints have to be named @_##Name the second character
+re_joint = re.compile(r"@\D*(?P<number>\d+)(?P<name>.*)", re.IGNORECASE)
+
 # Classes
 
 class Subobject(object):
@@ -690,6 +694,7 @@ class Subobject(object):
         self.parent      = None
         self.children    = []
         self.index       = 0
+        self.joint_id    = -1
         self.next        = None
         self.call        = None
         self.vhots       = vhots
@@ -706,16 +711,24 @@ class Subobject(object):
     def set_parent(self, new_par):
         self.parent = new_par
         # EXPERIMENTAL
-        # Now v4 Appending new children. This fixes wrong ordered submodels. 
-        # Together with index = i-1 this fixed joints as well, i-1 is done during the export in the Model class
-        if new_par.children:
-            self.next = new_par.children[-1]
-        #new_par.children.insert(0, self) # old
-        new_par.children.append(self)
-        if len(new_par.children) > 1: # "splits" instead of "call"
-            new_par.call = None
-        else: # no "splits"
-            new_par.call = new_par.children[-1]
+        # Back to the old method append method. Don't forget to change in Model class
+        if (False):
+            if new_par.children:
+                self.next = new_par.children[-1]
+            #new_par.children.insert(0, self) # old
+            new_par.children.append(self)
+            if len(new_par.children) > 1: # "splits" instead of "call"
+                new_par.call = None
+            else: # no "splits"
+                new_par.call = new_par.children[-1]
+        else:
+            if new_par.children:
+                self.next = new_par.children[0]
+            new_par.children.insert(0, self) # old
+            if len(new_par.children) > 1: # "splits" instead of "call"
+                new_par.call = None
+            else: # no "splits"
+                new_par.call = new_par.children[0]
         # Reindex entire tree
         flat_tree = self.get_root().list_subtree()
         for s, i in zip(flat_tree, range(len(flat_tree))):
@@ -824,7 +837,7 @@ class Model(object):
         for s in subs:
             node_bs = b''
             si        = s.index
-            node_bs  += encode_sub_node(si)
+            node_bs  += encode_sub_node(si) # This uses index too
             sphere_bs = encode_sphere(get_local_bbox_data(meshes[si]))
             call      = s.call
             nbf       = len(face_lists[si])
@@ -932,13 +945,18 @@ class Model(object):
                 unpack('<3H', bm.edges[1][ext_e])
             xform   = sub.matrix
             if sub.children:
-                child = sub.children[-1].index
+                child = sub.children[0].index
             else:
                 child = -1
             if sub.next:
                 sibling = sub.next.index
             else:
                 sibling = -1
+            # NEW
+            # In the bin struct this is named parent_id but it is the Joint ID. -1 means non moving 0+ refer to Joint1+
+            # regexp catches @s##__
+            isjoint = re_joint.match(sub.name)
+            parentid = int(isjoint['number']) if isjoint else -1
             if len(sub.children) > 1:
                 num_nodes = len(sub.children) - 1
             else:
@@ -948,7 +966,8 @@ class Model(object):
                 pack('b', sub.motion_type),
                 # NEW v4
                 # Currently index is 0, 1, ... as it is used for indexing. For parent it must be -1!
-                pack('<i', index -1),
+                # This is the ID of the parent.
+                pack('<i', parentid),
                 encode_floats([
                     sub.min,
                     sub.max,
@@ -1330,27 +1349,35 @@ def shift_box(box_data, matrix):
         min:tuple(matrix @ mu.Vector(box_data[min])),
         max:tuple(matrix @ mu.Vector(box_data[max]))}
 
-def tag_vhots(dl):
+def tag_vhots(generations):
     ids = {}
-    idx = 0
-    for gen in dl:
+    id_fix = 0
+    for gen in generations:
         for l in gen:
+            # l is vhot name and position
             for vhn, _ in l:
-                id_s = "".join(re.findall("\d", vhn))
+                # NEW vhot01 shall be the same as vhot01.001 when you copy an object and not 1001
+                id_s = re.search(r"\d+", vhn)
+                #id_s = "".join(re.findall("\d", vhn))
                 if id_s:
-                    id = int(id_s) % (2**32-1)
-                    ids[vhn] = idx if id in ids.values() else id
+                    id = int(id_s[0]) % (2**32-1)
+                    if id in ids.values():
+                        print("Warning: " + vhn + " with ID", id ,"already used by another VHot. Rename! Giving it ID", id_fix, "instead.")
+                        ids[vhn] = id_fix
+                    else:
+                        ids[vhn] = id
                 else:
-                    ids[vhn] = idx
-                while idx in ids.values():
-                    idx += 1
-    for gen in dl:
+                    ids[vhn] = id_fix
+                while id_fix in ids.values():
+                    id_fix += 1
+    # This renames the vhot to its number.
+    for gen in generations:
         for l in gen:
             for i in range(len(l)):
                 if l[i]:
                     name, pos = l[i]
                     l[i] = (ids[name], pos)
-    return dl
+    return generations
 
 def prep_vg_based_ordering(objs, bms):
     lookup1 = {}
@@ -1376,7 +1403,13 @@ def prep_vg_based_ordering(objs, bms):
 
 def prep_subs(all_objs, materials, use_origin, sorting):
     bbox, root, gen2, gen3_plus = categorize_objs(all_objs)
-    obj_lookup = {}
+    # Sort
+    # Ordering by their @s__XX name in case of some extreme sub joints are wanted.
+    # @s04bb can have child @s03cc. This fixes a index not found error in the gen3 as its not ordered by 03 < 04.
+    gen3_plus.sort(key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else re_joint.match(kv.name)['name'])
+    # Doing for gen2 as well as it would be consistent, root meshes get combined and are sorted by name already.
+    gen2.sort(key=lambda kv: (kv.name if kv.name[0].casefold() != "@" else re_joint.match(kv.name)['name'])
+    
     root_meshes = [get_mesh(o, materials) for o in root]
     gen2_meshes = [get_mesh(o, materials) for o in gen2]
     gen3_plus_meshes = [get_mesh(o, materials) for o in gen3_plus]
@@ -1421,18 +1454,18 @@ def prep_subs(all_objs, materials, use_origin, sorting):
             do_bsp(el)
     
     vhots = tag_vhots([
-        [[(e.name,origin_shift @ e.matrix_world.translation)
+        [[(e.name, origin_shift @ e.matrix_world.translation)
             for e in o.children if e.type == 'EMPTY']
                 for o in root],
-        [[(e.name,e.matrix_local.translation)
+        [[(e.name, e.matrix_local.translation)
             for e in o.children if e.type == 'EMPTY']
                 for o in gen2],
-        [[(e.name,e.matrix_local.translation)
+        [[(e.name, e.matrix_local.translation)
             for e in o.children if e.type == 'EMPTY']
                 for o in gen3_plus]])
+    obj_lookup = {}
     root_sub = Subobject(
         root[0].name, root_mesh, mu.Matrix([[0]*4] * 4), 0, 0.0, 0.0, [])
-    root_sub.index = -1
     for rvh in vhots[0]:
         root_sub.vhots.extend(rvh)
     for g2o, g2m, g2vh in zip(gen2, gen2_meshes, vhots[1]):
@@ -1608,10 +1641,11 @@ def get_objs_toexport(export_filter):
         return ('ERROR: Invalid export option', {'CANCELLED'}), None  # Can not happen
 
     # Sort alphabetically. Depending on the filter the order is not constant by default!
-    raw_objs = sorted(raw_objs, key=lambda kv: (kv.name if kv.name[0] != "@" else kv.name[1:]))
+    # raw_objs = sorted(raw_objs, key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else kv.name[1:].casefold())) 
+    #raw_objs = sorted(raw_objs, key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else re.search(r"\d+(.*)", kv.name, flags=re.IGNORECASE)[1]))
+    raw_objs = sorted(raw_objs, key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else re_joint.match(kv.name)['name']))
+    
     # This would sort aa < bb < ff else for example chestloc @s00ff < @s01bb
-    # But messes with joint as well. How?
-    # raw_objs = sorted(raw_objs, key=lambda kv: (kv.name if kv.name[0] != "@" else kv.name[4:]))
     return [o for o in raw_objs if o.type == 'MESH']
 
 def do_export(file_path, options):
