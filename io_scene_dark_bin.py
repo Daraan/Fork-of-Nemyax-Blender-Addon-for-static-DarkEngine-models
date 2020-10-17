@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dark Engine Static Model",
     "author": "nemyax",
-    "version": (0, 4, 20201008.2), # Using YMD
+    "version": (0, 4, 20201013.4), # Using YMD
     "blender": (2, 83, 7),
     "location": "File > Import-Export",
     "description": "Import and export Dark Engine static model .bin",
@@ -34,7 +34,7 @@ bl_info = {
 # Now using nodes.
 
 # file extension is now optional for texture import
-# if no image is found -> blank images
+# if no image is found -> UV_GRID images
 
 
 # 20201008.1
@@ -48,7 +48,21 @@ bl_info = {
 # Changed/Added export options:
 # Added all, current scene, visible, selected
 
-# TODO: Remove texture creation
+# 20201012.3
+
+# replaced current scene export with active collection
+
+# gif conversion with Pillows/PIL module, included
+
+# Import/Export dialogs are drawn with layout.
+
+# Added export with custom origin option
+
+# 20201013.4
+
+# Corrected submodel.index to be -1, 0, ... when exporting
+# Changed set_parent ordering
+# Together fixes wrong subobject order.
 
 import bpy
 import bmesh
@@ -402,25 +416,35 @@ def make_bbox(coords, collection):
     return bbox
 
 # NEW discarding file name extension for import.
-# Always creating a texture with BLANK image if not found
-# TODO: Textures are not used anymore only return image.
-def load_img(file_path, img_name):
+# Always creating a generated texture with UV_GRID image if not found
+# NEW : Returns image not texture!
+def load_img(file_path, img_name, options):
     dir_path = os.path.dirname(file_path)
     # File name without extension
-    img_noext = os.path.splitext(img_name.lower())[0]
+    img_noext, ext = os.path.splitext(img_name.lower())
+    # Special for replace#
+    if options['fancy_txtrepl'] and img_noext.startswith('replace'):
+        try:
+            num = int(img_noext[7]) # This could fail
+            if not img_name in bpy.data.images:
+                # Create fancy texture
+                bpy.ops.image.new(name=img_name, generated_type='COLOR_GRID')
+            img = bpy.data.images[img_name]
+            return img
+            # Would have liked to to invert via bpy.ops.image.invert for #=1 and 2
+        except ValueError:
+            pass # Fall back to standard import
+    
     ps       = os.sep
     files    = []
-    # Always creating a tex but could be empty texture
-    tex = bpy.data.textures.new(name=img_name, type='IMAGE')
     for n in (glob.glob(dir_path + ps + "*")):
         nl = os.path.split(n)[-1].lower()
         if ((nl == "txt") or (nl == "txt16")) and os.path.isdir(n):
             files.extend(glob.glob(n + ps + "*.???"))
     if not files:
-        print("No txt folder or image files found. Using empty image for", img_name)
-        bpy.ops.image.new(name=img_name, generated_type='BLANK')
-        tex.image = bpy.data.images[img_name]
-        return tex
+        print("No txt folder or image file found. Using empty image for", img_name)
+        bpy.ops.image.new(name=img_name, generated_type='UV_GRID')
+        return bpy.data.images[img_name]
     img_file = None
     for f in files:
         fbase = os.path.splitext(os.path.split(f)[-1])[0]
@@ -431,22 +455,54 @@ def load_img(file_path, img_name):
             break
     if not img_file:
         print(img_name, "not found in txt subfolders. Using empty image.")
-        img = bpy.ops.image.new(name=img_name, generated_type='BLANK')
-        tex.image = bpy.data.images[img_name]
-        return tex
-    # These are loaded textures on meshes
+        img = bpy.ops.image.new(name=img_name, generated_type='UV_GRID')
+        return bpy.data.images[img_name]
+    # Textures are not used anymore still keeping this around for a bit longer
     for t in bpy.data.textures:
         if t.type == 'IMAGE' and t.image != None and t.image.filepath == img_file:
-            return t
+            return t.image
     img = None
     # Loaded images
     for i in bpy.data.images:
         if i.filepath == img_file:
             img = i
             break
-    if not img:
-        img = bpy.data.images.load(img_file)
+    # Image already present    
+    if img:
+        return img
+    if ext != ".gif" or not options['convert_gif']:
+        return bpy.data.images.load(img_file)   
+    try:
+        #Convert to png and import again. Some lightweight converter would be cool
+        """import gif2numpy
+        frames, exts, image_specs = gif2numpy.convert(img_file, BGR2RGB=False)
+        print("Gif convert done.")
+        data = write_png(frames[0], 64, 64)
+        with open("//temp.png", 'wb') as fh:
+            fh.write(data)
+        img = bpy.data.images.load('//temp.png')"""
+        from PIL import Image
+        Image.open(img_file).save('temp.png')
+        img = bpy.data.images.load('//temp.png')
+    except Exception as e:
+        print(e, "\nImporter could not convert gif. Using blank image.")
+        bpy.ops.image.new(name=img_name, generated_type='BLANK')
+        img = bpy.data.images[img_name]
+    else:
+        print(img_name, 'found. Converted and packed as png.')
+        img.pack()
+        img.name = img_name
+        img.source = 'FILE'
+        img.filepath = img_file # So the above bpy.data.images check works.
+    return img
+            
+def create_texture(img):
+    # Optional textures are not needed anymore but good to manage images.
+    if "TEX for " + img.name.lower() in bpy.data.textures:
+        return bpy.data.textures["TEX for " + img.name.lower()]
+    tex = bpy.data.textures.new(name="TEX for " + img.name.lower(), type='IMAGE')
     tex.image = img
+    tex.use_fake_user = True
     return tex
 
 def make_objects(object_data, file_path, options):
@@ -464,24 +520,72 @@ def make_objects(object_data, file_path, options):
         obj = bpy.data.objects.new(name=mesh.name, object_data=mesh)
         obj.matrix_local = s.localMatrix()
         collection.objects.link(obj)
-        if s.motion == 1:
-            limits = obj.constraints.new(type='LIMIT_ROTATION')
-            limits.owner_space = 'LOCAL'
-            limits.min_x = s.min
-            limits.max_x = s.max
-        elif s.motion == 2:
-            limits = obj.constraints.new(type='LIMIT_LOCATION')
-            limits.owner_space = 'LOCAL'
-            limits.min_x = s.min
-            limits.max_x = s.max
+        
+        if (s.motion):
+            # For better visualization of the rotation axis
+            if s.motion == 1:
+                limits = obj.constraints.new(type='LIMIT_ROTATION')
+                limits.owner_space = 'LOCAL'
+                limits.min_x = s.min
+                limits.max_x = s.max
+                oldschool_char = "@x"
+            elif s.motion == 2:
+                limits = obj.constraints.new(type='LIMIT_LOCATION')
+                limits.owner_space = 'LOCAL'
+                limits.min_x = s.min
+                limits.max_x = s.max
+                oldschool_char = "@z"
+            if options['support_3ds_export']:
+                # Create axle for old school support
+                # XX must be replaced by parent but we don't have that info yet.
+                # TODO: Angles in Gon/4??? 
+                min = int(s.min / math.pi * 50) or "00"
+                max = int(s.max / math.pi * 50) or "00"
+                mesh = bpy.data.meshes.new(oldschool_char 
+                                            + obj.name[2:4] 
+                                            + "XX"
+                                            + str(max) + str(min))
+                axis = bpy.data.objects.new(mesh.name, mesh)
+                inv = obj.matrix_world.copy()
+                inv.invert()
+                # Vector as long as X, to be tested.
+                trans = mu.Vector([obj.dimensions[0], 0.0, 0.0]) @ inv
+                mesh.from_pydata([obj.matrix_world.translation, obj.matrix_world.translation + trans], [(0,1)], [])
+                axis.parent = obj
+                axis.show_axis = True
+                axis.show_in_front = True
+                collection.objects.link(axis)
+            else:
+                obj.show_axis = True
+                
         for v in s.vhots:
-            vhot_name = s.name + "-vhot-" + str(v[0])
-            vhot = bpy.data.objects.new(vhot_name, None)
+            if not options['support_3ds_export']:
+                vhot_name = s.name + "-vhot-" + str(v[0])
+                vhot = bpy.data.objects.new(vhot_name, None)
+                # Purely visual
+                vhot.empty_display_type = 'CUBE'
+                vhot.empty_display_size = 0.075
+            else:
+                # Create as a cube to for (future) 3ds to bin
+                # Could this be double digits?
+                vhot_name = "@h" + ("0" + str(v[0]) if v[0] < 10 else str(v[0])) + s.name
+                mesh = bpy.data.meshes.new(vhot_name)
+                vhot = bpy.data.objects.new(vhot_name, mesh)
+                # Create as cube
+                bm = bmesh.new()
+                bmesh.ops.create_cube(bm, size=0.075)
+                bm.to_mesh(mesh)
+                bm.free()
+                vhot.display_type = 'BOUNDS'
+                
             collection.objects.link(vhot)
             vhot.parent = obj
             vhot.location = v[1]
+            vhot.show_in_front = True
+                
+        # Only select new object.
         bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.mode_set(mode='EDIT') # initialises UVmap correctly
+        bpy.ops.object.mode_set(mode='EDIT') # initializes UVmap correctly
         mesh.uv_layers.new()
         for m in s.matsUsed.values():
             bpy.ops.object.material_slot_add()
@@ -498,14 +602,14 @@ def make_objects(object_data, file_path, options):
             mat.use_nodes = True
             nodes = mat.node_tree.nodes
             # This is the main node for the interface Surface
-            principles = nodes['Principled BSDF']
-            shaders = principles.inputs
+            shaders = nodes['Principled BSDF'].inputs
             
-            # Old was translucency 1 = invisible, now alpha = 0 is invis.
-            shaders["Alpha"].default_value = 1 - m[1]
-            # Emission is now color code. Only 1 is needed for export.
-            shaders["Emission"].default_value = (m[2], m[2], m[2], 1)
-            # Let's add node for strength value
+            # 0 is no alpha value => opaque => alpha = 1
+            if m[1] == 0.0:
+                shaders["Alpha"].default_value = 1.0
+            else:
+                shaders["Alpha"].default_value = m[1]
+            # For emission use nodes
             if (not shaders['Emission'].is_linked):
                 # Need a shader to RGB so it is displayed correctly
                 emissionNode = nodes.new('ShaderNodeEmission')
@@ -521,17 +625,19 @@ def make_objects(object_data, file_path, options):
                 emissionNode.label = "Emission: Strength value only"
             
             # Add image to new material
-            if (not shaders["Base Color"].is_linked):
-                texNode = nodes.new('ShaderNodeTexImage')
-                texNode.location = [-350, 350]
-                tex = load_img(file_path, mat_name)
-                if (tex):
-                    texNode.image = tex.image
+            if (not shaders["Base Color"].is_linked
+                or shaders["Base Color"].links[0].from_node.image == None): # This allows reimport after deletion
+                if (shaders["Base Color"].is_linked):
+                    texNode = shaders["Base Color"].links[0].from_node
                 else:
-                    print(mat_name, "not found in .\\txt using empty image.")
-                mat.node_tree.links.new( texNode.outputs['Color'], shaders["Base Color"] )
-                if (texNode.image.generated_type == "BLANK"):
+                    texNode = nodes.new('ShaderNodeTexImage')
+                    texNode.location = [-350, 350]
+                texNode.image = load_img(file_path, mat_name, options) # Always returns an image
+                # Might be useful for management.
+                create_texture(texNode.image)
+                if (texNode.image.type == 'UV_TEST'):
                     texNode.label = "IMAGE NOT FOUND"
+                mat.node_tree.links.new( texNode.outputs['Color'], shaders["Base Color"] )
             
             # End of new stuff apply mat to object
             obj.material_slots[-1].material = mat
@@ -599,13 +705,17 @@ class Subobject(object):
         return result
     def set_parent(self, new_par):
         self.parent = new_par
+        # EXPERIMENTAL
+        # Now v4 Appending new children. This fixes wrong ordered submodels. 
+        # Together with index = i-1 this fixed joints as well, i-1 is done during the export in the Model class
         if new_par.children:
-            self.next = new_par.children[0]
-        new_par.children.insert(0, self)
+            self.next = new_par.children[-1]
+        #new_par.children.insert(0, self) # old
+        new_par.children.append(self)
         if len(new_par.children) > 1: # "splits" instead of "call"
             new_par.call = None
         else: # no "splits"
-            new_par.call = new_par.children[0]
+            new_par.call = new_par.children[-1]
         # Reindex entire tree
         flat_tree = self.get_root().list_subtree()
         for s, i in zip(flat_tree, range(len(flat_tree))):
@@ -759,7 +869,6 @@ class Model(object):
         if materials:
             for m in materials:
                 if not m: continue
-                # TODO: Check if material is used
                 # Use the texture of the texture node instead of material name
                 if use_node_image:
                     image_name = None
@@ -797,11 +906,10 @@ class Model(object):
                     emission = inputNode.inputs['Strength'].default_value
                 else:
                     emission = max(shaders["Emission"].default_value[:-1])
-                # Translucency is 1 - Alpha
-                translucency = 1 - shaders["Alpha"].default_value
-
+                # Alpha = 1 is fully visible, as is alpha = 0! Low values are more transparent.
+                alpha = shaders["Alpha"].default_value
                 aux_data_bs += encode_floats([
-                    translucency,
+                    alpha,
                     min([1.0, emission])
                     ])
             self.aux_data_bs = aux_data_bs
@@ -824,7 +932,7 @@ class Model(object):
                 unpack('<3H', bm.edges[1][ext_e])
             xform   = sub.matrix
             if sub.children:
-                child = sub.children[0].index
+                child = sub.children[-1].index
             else:
                 child = -1
             if sub.next:
@@ -838,7 +946,9 @@ class Model(object):
             subs_bs += concat_bytes([
                 sub_names[sub.index],
                 pack('b', sub.motion_type),
-                pack('<i', index),
+                # NEW v4
+                # Currently index is 0, 1, ... as it is used for indexing. For parent it must be -1!
+                pack('<i', index -1),
                 encode_floats([
                     sub.min,
                     sub.max,
@@ -1134,7 +1244,6 @@ def get_mesh(obj, materials): # and tweak materials
     #bm.from_object(obj, bpy.context.scene)
     # Old code gave depsgraph wanted error just inserted not sure what this is about.
     bm.from_object(obj, bpy.context.evaluated_depsgraph_get())
-    # TODO: Trying this:
 
     strip_wires(bm) # goodbye, box tweak hack
     uvs = bm.loops.layers.uv.verify()
@@ -1207,6 +1316,7 @@ def categorize_objs(objs):
         bbox = {min:tuple(bmin),max:tuple(bmax)}
     for b in custom_bboxes:
         objs.remove(b)
+        
     root = [o for o in objs if o.data.polygons and not (o.parent in objs)]
     gen2 = [o for o in objs if o.data.polygons and o.parent in root]
     gen3_plus = [o for o in objs if
@@ -1264,7 +1374,7 @@ def prep_vg_based_ordering(objs, bms):
                     mark = lookup2[lookup1[(bmi,a)]]
                     f[ord] = mark
 
-def prep_subs(all_objs, materials, world_origin, sorting):
+def prep_subs(all_objs, materials, use_origin, sorting):
     bbox, root, gen2, gen3_plus = categorize_objs(all_objs)
     obj_lookup = {}
     root_meshes = [get_mesh(o, materials) for o in root]
@@ -1278,9 +1388,15 @@ def prep_subs(all_objs, materials, world_origin, sorting):
         for a, b in zip(gen3_plus, gen3_plus_meshes):
             prep_vg_based_ordering([a], [b])
             do_groups(b)
-    root_mesh = combine_meshes(root_meshes, [o.matrix_world for o in root])
+    # Use object's position in blender as model origin
+    if not use_origin == 'Custom':
+        root_mesh = combine_meshes(root_meshes, [o.matrix_world for o in root])
+    else:
+        root_mesh = combine_meshes(root_meshes, [o.matrix_local for o in root])
     if sorting == 'vgs':
         do_groups(root_mesh)
+    
+    # Use custom or calced bbox
     real_bbox = find_common_bbox(
         [mu.Matrix.Identity(4)] +
         [o.matrix_world for o in gen2] +
@@ -1288,15 +1404,22 @@ def prep_subs(all_objs, materials, world_origin, sorting):
         [root_mesh] + gen2_meshes + gen3_plus_meshes)
     if not bbox:
         bbox = real_bbox
-    if world_origin:
+    # Origin shift
+    if use_origin == 'World':
         origin_shift = mu.Matrix.Identity(4)
-    else:
+    elif use_origin == 'Center':
         origin_shift = mu.Matrix.Translation(
             (mu.Vector(real_bbox[max]) + mu.Vector(real_bbox[min])) * -0.5)
+    else: #use_origin == 'Custom'
+        origin_shift =  mu.Matrix.Translation(-root[0].matrix_local.translation)
+    
     root_mesh.transform(origin_shift)
+    bbox = shift_box(bbox, origin_shift)
+    
     if sorting == 'bsp':
         for el in gen2_meshes + gen3_plus_meshes + [root_mesh]:
             do_bsp(el)
+    
     vhots = tag_vhots([
         [[(e.name,origin_shift @ e.matrix_world.translation)
             for e in o.children if e.type == 'EMPTY']
@@ -1309,6 +1432,7 @@ def prep_subs(all_objs, materials, world_origin, sorting):
                 for o in gen3_plus]])
     root_sub = Subobject(
         root[0].name, root_mesh, mu.Matrix([[0]*4] * 4), 0, 0.0, 0.0, [])
+    root_sub.index = -1
     for rvh in vhots[0]:
         root_sub.vhots.extend(rvh)
     for g2o, g2m, g2vh in zip(gen2, gen2_meshes, vhots[1]):
@@ -1323,7 +1447,7 @@ def prep_subs(all_objs, materials, world_origin, sorting):
         sub = Subobject(g3po.name, g3pm, mtx, m_type, m_min, m_max, g3pvh)
         sub.set_parent(obj_lookup[g3po.parent])
         obj_lookup[g3po] = sub
-    return root_sub, shift_box(bbox, origin_shift)
+    return root_sub, bbox
 
 # Each bmesh is extended with custom bytestring data used by the exporter.
 # Edges #0 and #1 carry custom mesh-level attributes.
@@ -1468,33 +1592,38 @@ class OffsetWrapper(object):
         self.n_off  = 0
         self.f_off  = 0
 
-def do_export(file_path, options):
-    #if options['vis_view']:
-    #    check_layers = set(
-    #        [i for (b,i) in zip(bpy.context.scene.collection, range(20)) if b])
-    #else:
-    #    check_layers = set(range(20))
 
-    if (options['export_filter'] == 'visible'):
+def get_objs_toexport(export_filter):
+    # Also for draw layout
+    if (export_filter == 'visible'):
         raw_objs = bpy.context.visible_objects
-    elif (options['export_filter'] == 'selected'):
+    elif (export_filter == 'selected'):
         raw_objs = bpy.context.selected_objects
-    elif (options['export_filter'] == 'in scene'):
-        raw_objs = bpy.context.scene.collection.all_objects
-    elif (options['export_filter'] == 'all'):
+    elif (export_filter == 'collection'):
+        # all_objects will also give objects in child collections
+        raw_objs = bpy.context.collection.all_objects
+    elif (export_filter == 'all'):
         raw_objs = bpy.data.objects
     else:
-        return ('ERROR: Invalid export option',{'CANCELLED'})  # should not happen
+        return ('ERROR: Invalid export option', {'CANCELLED'}), None  # Can not happen
 
-    
-    objs = [o for o in raw_objs if o.type == 'MESH']
+    # Sort alphabetically. Depending on the filter the order is not constant by default!
+    raw_objs = sorted(raw_objs, key=lambda kv: (kv.name if kv.name[0] != "@" else kv.name[1:]))
+    # This would sort aa < bb < ff else for example chestloc @s00ff < @s01bb
+    # But messes with joint as well. How?
+    # raw_objs = sorted(raw_objs, key=lambda kv: (kv.name if kv.name[0] != "@" else kv.name[4:]))
+    return [o for o in raw_objs if o.type == 'MESH']
+
+def do_export(file_path, options):
+    objs = get_objs_toexport(options['export_filter'])
     if not objs:
         return ("Nothing to export.",{'CANCELLED'})
+    
     materials = gather_materials(objs)
     root_sub, bbox = prep_subs(
         objs,
         materials,
-        options['world_origin'],
+        options['use_origin'],
         options['sorting'])
     offs = OffsetWrapper()
     for s in root_sub.list_subtree():
@@ -1517,7 +1646,7 @@ def do_export(file_path, options):
     except struct.error:
         msg = "The model has too many polygons. Export cancelled.\n"
         result = {'CANCELLED'}
-    return (msg,result)
+    return (msg, result)
 
 ###
 ### Sorting: common
@@ -1672,14 +1801,42 @@ class ImportDarkBin(bpy.types.Operator, ImportHelper):
         name="Group in new collection",
         default=True,
         description="Group together in a new collection. Else in scene.")
+    fancy_txtrepl : BoolProperty(
+        name="Use fancy replace0.gif",
+        default=True,
+        description="Uses special images for replace# image names."
+                     +" Deactivate if you have a custom replace# texture.")
+    convert_gif : BoolProperty(
+        name="(Experimental) Try to convert gifs",
+        default=True,
+        description="See the guide. This needs an extra python script Pillows!" +
+                     " Gifs will be converted to png and packed in the file.")
+    support_3ds_export : BoolProperty(
+        name="(Experimental) Oldschool VHots+Axis",
+        default=False,
+        description="To be used with 3ds export and extern bsp.exe." +
+                     " NOT COMPATIBLE with static exporter.") #,
+        #options={'HIDDEN'})
+            
     
     path_mode : path_reference_mode
     check_extension : True
     path_mode : path_reference_mode # Why double?
 
+    def draw(self, context):
+        # Fancy
+        self.layout.prop(self, 'use_collections', icon='GROUP')
+        self.layout.prop(self, 'fancy_txtrepl', icon='TEXTURE_DATA')
+        self.layout.prop(self, 'convert_gif', icon='PACKAGE')
+        #
+        self.layout.prop(self, 'support_3ds_export', icon='ERROR')
+
     def execute(self, context):
         options = {
-            'use_collections' :self.use_collections}
+            'use_collections'       :self.use_collections,
+            'fancy_txtrepl'         :self.fancy_txtrepl,
+            'convert_gif'           : self.convert_gif,
+            'support_3ds_export'   : self.support_3ds_export,}
         msg, result = do_import(self.filepath, options)
         print(msg)
         return result
@@ -1691,61 +1848,93 @@ class ExportDarkBin(bpy.types.Operator, ExportHelper):
     bl_label = 'Export BIN'
     bl_options = {'PRESET'}
     filename_ext = ".bin"
+    path_mode : path_reference_mode
+    check_extension = True
+    path_mode : path_reference_mode # Why double?
 
     filter_glob : StringProperty(
         default="*.bin",
         options={'HIDDEN'})
-    #vis_view : BoolProperty(
-    #    name="Export visible only",
-    #    default=True,
-    #    description="Objects hidden in the view will be ignored")
-    export_filter : EnumProperty(
-        name="Export only",
-        items=(
-            ("selected","Selected","Only currently selected."),
-            ("visible","Visible","Hidden objects are ignored."),
-            ("in scene", "In Scene", "Exports objects in the current active Scene Collection."),
-            ("all","All Scenes","Export all objects in the file.")),
-        default="visible")
     clear : BoolProperty(
-        name="Use Translucency",
+        name="Use Alpha",
         default=True,
-        description="Use the Translucency values set on materials")
+        description="Use the Alpha value from Material->Surface")
     bright : BoolProperty(
         name="Use Emission",
         default=True,
-        description="Use the Emit values set on materials")
-    sorting : EnumProperty(
-        name="Polygon sorting method",
-        items=(
-            ("bsp","BSP","".join([
-                "May increase the polygon count unpredictably;",
-                " use only if you need transparency support"])),
-            ("vgs","By vertex group","".join([
-                "Follow the alphabetical order of vertex group names"])),
-            ("none","Don't sort","")),
-        default="vgs")
-    world_origin : BoolProperty(
-            name="Model origin is at world origin",
-            default=True,
-            description="Otherwise, it is in the center of the geometry")
+        description="Use the Emission value from Material->Surface."
+                    + " Preferred is Strength from Emission node, else highest R,G or B")
     node_texture : BoolProperty(
             name="Use image instead of material name",
             default=True,
-            description="Use the Base Color image instead of the material name for the models textures.")
-            
-    path_mode : path_reference_mode
-    check_extension : True
-    path_mode : path_reference_mode # Why double?
+            description="Use the Base Color image instead of the material name"
+                        +" for the models textures.")
+    sorting : EnumProperty(
+        name="Sort",
+        items=(
+            ("bsp","BSP","".join([
+                "May increase the polygon count unpredictably;",
+                " use only if you need transparency support"]), 'NLA', 1),
+            ("vgs","By vertex group","".join([
+                "Follow the alphabetical order of vertex group names"]), 'GROUP_VERTEX', 2),
+            ("none","Don't sort","", 'BLANK', 3)),
+        default="vgs")                                    
+    use_origin : EnumProperty(
+        name="Origin",
+        items=(
+            ("World","World origin","Model origin is at world origin", 'EMPTY_ARROWS',1),
+            ("Center","Bounding Box center","Bounding box center.", 'LIGHTPROBE_CUBEMAP', 2),
+            ("Custom","Object origin","Use origin like defined in blender.", 'TRANSFORM_ORIGINS', 3)),
+        default="Center")
+    export_filter : EnumProperty(
+        name="Export only",
+        items=(
+            ("selected","Selected","Only currently selected.", 'SELECT_SET', 1),
+            ("visible","Visible","Hidden objects are ignored.", 'HIDE_OFF', 2),
+            ("collection", "Active Collection", "Exports objects in the current active collection.", 'GROUP', 4),
+            ("all","All","Export all objects in the file.", 'BLENDER' ,8)),
+        default="visible")
 
-            
+    allow_in_edit : BoolProperty(
+        options={'HIDDEN'},
+        default=True)
+
+    
+    @classmethod
+    def poll(cls, context):
+        # Mesh data is updated on leaving edit mode
+        # which could lead to an unexpected old export result.
+        if not context.active_object: return True # Then we can't be in edit mode
+        if context.active_object.mode in {'OBJECT'}:
+            return True
+        else:
+            return cls.__annotations__['allow_in_edit']
+    
+    def draw(self, context):
+        # Fancy
+        if context.active_object and context.active_object.mode == 'EDIT':
+            self.layout.label(text="You are in Edit Mode. Mesh maybe not up to date", icon='ERROR')
+        for prop in self.__annotations__:
+            if not 'options' in self.__annotations__[prop][1]:
+                if prop == 'bright':
+                    self.layout.prop(self, prop, icon='LIGHT')
+                elif prop == 'clear':
+                    self.layout.prop(self, prop, icon='XRAY')
+                elif prop == 'node_texture':
+                    self.layout.prop(self, prop, icon='FILE_IMAGE')
+                else:
+                    self.layout.prop(self, prop)
+        self.layout.separator_spacer()
+        self.layout.label(text="-- Objects to be exported --")
+        for o in get_objs_toexport(self.export_filter):
+            self.layout.label(text=o.name) 
+    
     def execute(self, context):
         options = {
             'clear'       :self.clear,
             'bright'      :self.bright,
-            'world_origin':self.world_origin,
+            'use_origin'  :self.use_origin,
             'sorting'     :self.sorting,
-            #'vis_view'   :self.vis_view
             'export_filter':self.export_filter,
             'node_texture' : self.node_texture}
         msg, result = do_export(self.filepath, options)
