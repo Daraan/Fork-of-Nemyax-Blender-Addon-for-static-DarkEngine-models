@@ -11,61 +11,6 @@ bl_info = {
     "category": "Import-Export"
 }
 
-
-# 2.8 Update info:
-# 20200710.1
-# (un)registering with : bpy.utils.(un)register_class
-# Menu with: TOPBAR_MT_file_import
-
-# -bpy.context.scene.objects.link
-# +bpy.context.scene.collection.objects.link
-
-# -bpy.context.scene.objects.active
-# +bpy.context.view_layer.objects.active
-
-# -mesh.uv_textures.new
-# +mesh.uv_layers.new
-
-# -bbox.draw_type = 'BOUNDS'
-# +bbox.display_type = 'BOUNDS'
-
-# -img.mapping = 'UV'
-# -apply_tex(mat, tex) # Textures are not used anymore
-# -mat.translucency
-# -mat.emit
-# Now using nodes.
-
-# file extension is now optional for texture import
-# if no image is found -> UV_GRID images
-
-
-# 20201008.1
-# class import options changed = to :
-
-# Matmul * replaced with new operator @
-
-# Import Option: Group together in new collection
-
-# -obj.hide 
-# Changed/Added export options:
-# Added all, current scene, visible, selected
-
-# 20201012.3
-
-# replaced current scene export with active collection
-
-# gif conversion with Pillows/PIL module, included
-
-# Import/Export dialogs are drawn with layout.
-
-# Added export with custom origin option
-
-# 20201013.4
-
-# Corrected submodel.index to be -1, 0, ... when exporting
-# Changed set_parent ordering
-# Together fixes wrong subobject order.
-
 import bpy
 import bmesh
 import mathutils as mu
@@ -712,7 +657,7 @@ class Subobject(object):
         self.parent = new_par
         # EXPERIMENTAL
         # Back to the old method append method. Don't forget to change in Model class
-        if (False):
+        if (True):
             if new_par.children:
                 self.next = new_par.children[-1]
             #new_par.children.insert(0, self) # old
@@ -934,6 +879,11 @@ class Model(object):
         self.names = sub_names
         for sub in subs:
             index = sub.index
+            # NEW v6
+            # This is the joint number, -1 means it will not move / it moves relative to it's parent
+            # regexp catches @s##__ the number
+            isjoint = re_joint.match(sub.name)
+            jointid = int(isjoint['number']) if isjoint else -1
             vhot_off = deep_count(vhots[:index])
             num_vhots = len(sub.vhots)
             bm = sub.mesh
@@ -945,18 +895,13 @@ class Model(object):
                 unpack('<3H', bm.edges[1][ext_e])
             xform   = sub.matrix
             if sub.children:
-                child = sub.children[0].index
+                child = sub.children[-1].index
             else:
                 child = -1
             if sub.next:
                 sibling = sub.next.index
             else:
                 sibling = -1
-            # NEW
-            # In the bin struct this is named parent_id but it is the Joint ID. -1 means non moving 0+ refer to Joint1+
-            # regexp catches @s##__
-            isjoint = re_joint.match(sub.name)
-            parentid = int(isjoint['number']) if isjoint else -1
             if len(sub.children) > 1:
                 num_nodes = len(sub.children) - 1
             else:
@@ -964,10 +909,8 @@ class Model(object):
             subs_bs += concat_bytes([
                 sub_names[sub.index],
                 pack('b', sub.motion_type),
-                # NEW v4
-                # Currently index is 0, 1, ... as it is used for indexing. For parent it must be -1!
-                # This is the ID of the parent.
-                pack('<i', parentid),
+                # NEW v6: 
+                pack('<i', jointid),
                 encode_floats([
                     sub.min,
                     sub.max,
@@ -1406,9 +1349,9 @@ def prep_subs(all_objs, materials, use_origin, sorting):
     # Sort
     # Ordering by their @s__XX name in case of some extreme sub joints are wanted.
     # @s04bb can have child @s03cc. This fixes a index not found error in the gen3 as its not ordered by 03 < 04.
-    gen3_plus.sort(key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else re_joint.match(kv.name)['name'])
+    gen3_plus.sort(key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else re_joint.match(kv.name)['name']))
     # Doing for gen2 as well as it would be consistent, root meshes get combined and are sorted by name already.
-    gen2.sort(key=lambda kv: (kv.name if kv.name[0].casefold() != "@" else re_joint.match(kv.name)['name'])
+    gen2.sort(key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else re_joint.match(kv.name)['name']))
     
     root_meshes = [get_mesh(o, materials) for o in root]
     gen2_meshes = [get_mesh(o, materials) for o in gen2]
@@ -1644,8 +1587,6 @@ def get_objs_toexport(export_filter):
     # raw_objs = sorted(raw_objs, key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else kv.name[1:].casefold())) 
     #raw_objs = sorted(raw_objs, key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else re.search(r"\d+(.*)", kv.name, flags=re.IGNORECASE)[1]))
     raw_objs = sorted(raw_objs, key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else re_joint.match(kv.name)['name']))
-    
-    # This would sort aa < bb < ff else for example chestloc @s00ff < @s01bb
     return [o for o in raw_objs if o.type == 'MESH']
 
 def do_export(file_path, options):
@@ -1834,22 +1775,23 @@ class ImportDarkBin(bpy.types.Operator, ImportHelper):
     use_collections : BoolProperty(
         name="Group in new collection",
         default=True,
-        description="Group together in a new collection. Else in scene.")
+        description="Group together in a new collection. Else in scene")
     fancy_txtrepl : BoolProperty(
         name="Use fancy replace0.gif",
         default=True,
         description="Uses special images for replace# image names."
-                     +" Deactivate if you have a custom replace# texture.")
+                     +" Deactivate if you have a custom replace# texture")
     convert_gif : BoolProperty(
         name="(Experimental) Try to convert gifs",
         default=True,
-        description="See the guide. This needs an extra python script Pillows!" +
-                     " Gifs will be converted to png and packed in the file.")
+        description="See the guide. This needs an extra python script Pillow!" \
+                     + " Gifs will be converted to png and packed in the file."\
+                     + " Blank image on failure")
     support_3ds_export : BoolProperty(
         name="(Experimental) Oldschool VHots+Axis",
         default=False,
         description="To be used with 3ds export and extern bsp.exe." +
-                     " NOT COMPATIBLE with static exporter.") #,
+                     " NOT COMPATIBLE with static exporter") #,
         #options={'HIDDEN'})
             
     
