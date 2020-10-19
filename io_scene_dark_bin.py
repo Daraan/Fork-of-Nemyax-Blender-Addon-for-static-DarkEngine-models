@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dark Engine Static Model",
     "author": "nemyax",
-    "version": (0, 5, 20201017.6), # Using YMD
+    "version": (0, 5, 20201019.7), # Using YMD
     "blender": (2, 83, 7),
     "location": "File > Import-Export",
     "description": "Import and export Dark Engine static model .bin",
@@ -409,7 +409,7 @@ def load_img(file_path, img_name, options):
         if t.type == 'IMAGE' and t.image != None and t.image.filepath == img_file:
             return t.image
     img = None
-    # Loaded images
+    # Already loaded images
     for i in bpy.data.images:
         if i.filepath == img_file:
             img = i
@@ -417,22 +417,25 @@ def load_img(file_path, img_name, options):
     # Image already present    
     if img:
         return img
-    if ext != ".gif" or not options['convert_gif']:
+    # Making sure that the found texture is not a gif in case one was searched for.
+    ext_found = os.path.splitext(img_file.lower())[1] != ".gif"
+    if ext_found != ".gif" or not options['convert_gif'] or ext_found != ".gif" :
+        if ext == ".gif":
+            print(img_name, "was gif but supported format", ext_found, "found in txt folder.")
         return bpy.data.images.load(img_file)   
+    # Do gif conversion
     try:
-        #Convert to png and import again. Some lightweight converter would be cool
-        """import gif2numpy
-        frames, exts, image_specs = gif2numpy.convert(img_file, BGR2RGB=False)
-        print("Gif convert done.")
-        data = write_png(frames[0], 64, 64)
-        with open("//temp.png", 'wb') as fh:
-            fh.write(data)
-        img = bpy.data.images.load('//temp.png')"""
-        from PIL import Image
-        Image.open(img_file).save('temp.png')
-        img = bpy.data.images.load('//temp.png')
+        #Convert to png and import temporary file.
+        from gif2png import convert as gif2png
+        filename = gif2png(img_file, bpy.app.tempdir+"temp.png")
+        try:
+            # This should not fail but in case.
+            img = bpy.data.images.load(filename)
+        except Exception as e:
+            print(e, "\nConversion of",img_file,"to", filename,"was successful but can't load file.")
+            raise e
     except Exception as e:
-        print(e, "\nImporter could not convert gif. Using blank image.")
+        print(e, "Importer could not convert gif:", img_file, "Using blank image.")
         bpy.ops.image.new(name=img_name, generated_type='BLANK')
         img = bpy.data.images[img_name]
     else:
@@ -1793,8 +1796,7 @@ class ImportDarkBin(bpy.types.Operator, ImportHelper):
         description="To be used with 3ds export and extern bsp.exe." +
                      " NOT COMPATIBLE with static exporter") #,
         #options={'HIDDEN'})
-            
-    
+  
     path_mode : path_reference_mode
     check_extension : True
     path_mode : path_reference_mode # Why double?
@@ -1870,26 +1872,11 @@ class ExportDarkBin(bpy.types.Operator, ExportHelper):
             ("collection", "Active Collection", "Exports objects in the current active collection.", 'GROUP', 4),
             ("all","All","Export all objects in the file.", 'BLENDER' ,8)),
         default="visible")
-
-    allow_in_edit : BoolProperty(
-        options={'HIDDEN'},
-        default=True)
-
-    
-    @classmethod
-    def poll(cls, context):
-        # Mesh data is updated on leaving edit mode
-        # which could lead to an unexpected old export result.
-        if not context.active_object: return True # Then we can't be in edit mode
-        if context.active_object.mode in {'OBJECT'}:
-            return True
-        else:
-            return cls.__annotations__['allow_in_edit']
     
     def draw(self, context):
         # Fancy
         if context.active_object and context.active_object.mode == 'EDIT':
-            self.layout.label(text="You are in Edit Mode. Mesh maybe not up to date", icon='ERROR')
+            self.layout.label(text="You are in Edit Mode.\nMesh data maybe not up to date", icon='ERROR')
         for prop in self.__annotations__:
             if not 'options' in self.__annotations__[prop][1]:
                 if prop == 'bright':
@@ -1928,9 +1915,7 @@ def menu_func_export_bin(self, context):
     self.layout.operator(
         ExportDarkBin.bl_idname, text="Dark Engine Static Model (.bin)")
 
-# Blender 2.80+ upgrade
-
-
+# Blender 2.80+ 
 def register():
     bpy.utils.register_class(ImportDarkBin)
     bpy.utils.register_class(ExportDarkBin)
