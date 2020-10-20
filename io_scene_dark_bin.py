@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dark Engine Static Model",
     "author": "nemyax",
-    "version": (0, 5, 20201020.7), # Using YMD
+    "version": (0, 5, 7, 20201020), # Using YMD
     "blender": (2, 83, 7),
     "location": "File > Import-Export",
     "description": "Import and export Dark Engine static model .bin",
@@ -423,9 +423,9 @@ def load_img(file_path, img_name, options):
         return img
     # Making sure that the found texture is not a gif in case one was searched for.
     ext_found = os.path.splitext(img_file.lower())[1]
-    if ext_found != ".gif" or not options['convert_gif'] or ext_found != ".gif" :
-        if ext == ".gif":
-            print(img_name, "was gif but supported format", ext_found, "found in txt folder.")
+    if ext_found != ".gif" or not options['convert_gif']:
+        if ext == ".gif" and ext_found != ".gif":
+            print("Was searching for", img_name, " but found supported image type:", img_noext+ext_found)
         return bpy.data.images.load(img_file)   
     # Do gif conversion
     try:
