@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dark Engine Static Model",
     "author": "nemyax",
-    "version": (0, 5, 20201019.7), # Using YMD
+    "version": (0, 5, 20201020.7), # Using YMD
     "blender": (2, 83, 7),
     "location": "File > Import-Export",
     "description": "Import and export Dark Engine static model .bin",
@@ -377,8 +377,12 @@ def load_img(file_path, img_name, options):
                 # Create fancy texture
                 bpy.ops.image.new(name=img_name, generated_type='COLOR_GRID')
             img = bpy.data.images[img_name]
+            # This is just visual to differentiate between the textures.
+            if img_noext[-1] == "1":
+                img.colorspace_settings.name = 'Filmic Log'
+            elif img_noext[-1] == "2":
+                img.colorspace_settings.name = 'Linear'
             return img
-            # Would have liked to to invert via bpy.ops.image.invert for #=1 and 2
         except ValueError:
             pass # Fall back to standard import
     
@@ -418,7 +422,7 @@ def load_img(file_path, img_name, options):
     if img:
         return img
     # Making sure that the found texture is not a gif in case one was searched for.
-    ext_found = os.path.splitext(img_file.lower())[1] != ".gif"
+    ext_found = os.path.splitext(img_file.lower())[1]
     if ext_found != ".gif" or not options['convert_gif'] or ext_found != ".gif" :
         if ext == ".gif":
             print(img_name, "was gif but supported format", ext_found, "found in txt folder.")
@@ -1778,24 +1782,22 @@ class ImportDarkBin(bpy.types.Operator, ImportHelper):
     use_collections : BoolProperty(
         name="Group in new collection",
         default=True,
-        description="Group together in a new collection. Else in scene")
+        description="Group together in a new collection. Else in scene.")
     fancy_txtrepl : BoolProperty(
         name="Use fancy replace0.gif",
         default=True,
         description="Uses special images for replace# image names."
                      +" Deactivate if you have a custom replace# texture")
     convert_gif : BoolProperty(
-        name="(Experimental) Try to convert gifs",
+        name="Convert gifs",
         default=True,
-        description="See the guide. This needs an extra python script Pillow!" \
-                     + " Gifs will be converted to png and packed in the file."\
-                     + " Blank image on failure")
+        description="Gifs will be converted to png and packed in the file."\
+                     + " Blank image on failure. Not using this option will print warnings")
     support_3ds_export : BoolProperty(
         name="(Experimental) Oldschool VHots+Axis",
         default=False,
         description="To be used with 3ds export and extern bsp.exe." +
                      " NOT COMPATIBLE with static exporter") #,
-        #options={'HIDDEN'})
   
     path_mode : path_reference_mode
     check_extension : True
