@@ -8,3 +8,6 @@ Original source https://sourceforge.net/p/blenderbitsbobs/wiki/Dark%20Engine%20m
 Besides the compatibility with Blender 2.80+ various other options for im- an export have been added.
 An old problem with joint order has been fixed end even further allows the usage of more than six moving object parts.
 
+Future location of the online documentation :
+[Documentation](https://daraan.github.io/Fork-of-Nemyax-Blender-Addon-for-static-DarkEngine-models/)
+
