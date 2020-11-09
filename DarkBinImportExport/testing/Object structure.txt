@@ -1,0 +1,72 @@
+# Part of MDS.h
+
+// Model header, the big guy
+typedef struct mds_model {
+   char        id[4];   // name of model "LGMD"
+   uint        ver;     // version of bsp that produced it
+   char        name[8]; // name of model
+   float       radius;  // bounding sphere radius, zero centered
+   float       max_pgon_radius;  // maximum polygon radius
+   mxs_vector  bmax; // bbox maximum
+   mxs_vector  bmin; // bbox minimum
+   mxs_vector  pcen;  // centroid pos relative to parent
+   ushort pgons;  // number of pgons
+   ushort verts;  // number of verts
+   ushort parms;  // max id of parms
+   ubyte mats;    // number of materials
+   ubyte vcalls;  // number of vcalls
+   ubyte vhots;   // number of hot spots
+   ubyte subobjs;	// number of subobjs
+
+   ulong subobj_off;	// relative to start of the model, used to generate pointers
+   ulong mat_off;    // offset of materials
+   ulong uv_off;
+   ulong vhot_off;
+   ulong point_off;
+   ulong light_off;
+   ulong norm_off;
+   ulong pgon_off;
+   ulong node_off;
+   ulong mod_size;   // size of the model
+   // Next time, make materials field expandable...
+   ulong mat_flags;     // which features are used, trans, illum, etc.
+   ulong amat_off;      // offset of auxilliary material info
+   ulong amat_size;     // size of new material, never assume size of struct
+
+   ulong  mesh_off;
+   ulong  submeshlist_off;
+   ushort meshes;
+} mds_model;
+
+
+// Subobjects
+// Each subobject header contains the starting index and number of
+// subobject specific thing
+
+enum _mde_sub {
+   MD_SUB_NONE,   // no strangeness in subobject, no rotation or sliding
+   MD_SUB_ROT,	   // rotating subobject, use parameter
+   MD_SUB_SLIDE   // sliding subobject, use parameter
+};
+typedef unsigned char mde_sub;
+
+typedef struct mds_subobj {
+   char name[8];	// name of subobject
+   mde_sub type;	// type of subobj rot, or slide
+   int parm;		// which parameter it uses (can share)
+   float min_range;	// range of motion
+   float max_range;	// range of motion
+   mxs_trans trans;  // transform to put through after rotation
+   short child;      // First child object, if any, -1 if none
+   short next;       // next child object in list, -1 if none
+   ushort vhot_start;
+   ushort vhot_num;
+   ushort point_start;	// index of starting point
+   ushort point_num;	// number of points in that subobject
+   ushort light_start;  // relative to start of list
+   ushort light_num;
+   ushort norm_start;   // relative to start of list
+   ushort norm_num;
+   ushort node_start;	// relative to start of list
+   ushort node_num;     // just so we know
+} mds_subobj;

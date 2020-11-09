@@ -1740,11 +1740,10 @@ def prep_subs(all_objs, materials, use_origin, sorting):
         ordered, groups, NodeMaker = SortingHelper.SortByNormals(mesh, mode='ZDist', make_nodes=True, sphere_hat=True)
         if sorting == 'zdist':
             # Reordering makes faces invalid need to store only indices.
-            SortingHelper.SimplifyGroups(groups, ordered)
             # Reorder
             reorder_faces(mesh, ordered)
             # Now restore groups
-            SortingHelper.RestoreGroups(groups, mesh)
+            SortingHelper.ExportFace.refresh_faces(mesh)
         MainNode = NodeMaker(mesh, groups, sphere_hat=True)
         if MainNode:
             Nodes_dict[mesh] = MainNode
