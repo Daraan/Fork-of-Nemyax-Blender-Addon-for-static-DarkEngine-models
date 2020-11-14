@@ -20,15 +20,21 @@ typedef struct mds_sphere {
 """
 
 
-
-
 class ExportFace:
+    """
+    Instance holds data important for exporting.
+    Classmethods relations between faces
+    """
     LookUpCanSee = {}
     LookUpSeenBy = {}
     LookUpFaces  = {}       # mesh specific but maybe not complete!
     LookUpConflicts = {}
     LookUpCanSeeConflict = {}
     LookUpIsSeenConflict = {}
+    # This will be better
+    # TODO: clean up / integreate unnecessary dicts
+    LookUpMatrix = {}
+    activeMesh = None
     
     @classmethod
     def allFacesInObject(cls):     # May not be complete!
@@ -40,6 +46,8 @@ class ExportFace:
     
     @classmethod
     def buildFaces(cls, mesh):
+        activeMesh = mesh
+        mat = cls.LookUpMatrix[mesh] = np.zeros((len(mesh.faces), len(mesh.faces)), dtype=bool)        
         can_see = cls.LookUpCanSee[mesh] = {}
         seen_by = cls.LookUpSeenBy[mesh] = {f2:[] for f2 in mesh.faces}
         for f1 in mesh.faces:
@@ -48,7 +56,9 @@ class ExportFace:
                 if f1 == f2:
                     continue
                 f1 = f_new
-                if cls.FaceVisible(f1, f2):
+                visible = cls.FaceVisible(f1, f2)
+                if visible:
+                    mat[f1.index, f2.index] = visible
                     can_see.setdefault(f1, []).append(f2)
                     seen_by[f2].append(f1)
                     if f2.index > f1.index:
@@ -85,7 +95,13 @@ class ExportFace:
     @classmethod
     def get(cls, idx, mesh):
         # mesh.faces[idx] should be faster but if somehow disordered
-        return cls.LookUpFaces[mesh][idx]
+        if type(idx) == int:
+            return cls.LookUpFaces[mesh][idx]
+        return np.array(cls.LookUpFaces[mesh])[idx].tolist()
+    
+    @classmethod
+    def __getitem__(cls, idx):
+        return LookUpFaces[activeMesh][idx]
     
     @classmethod
     def refresh_faces(cls, mesh):
@@ -133,7 +149,20 @@ class ExportFace:
     @classmethod
     def getFacesNotSeen(cls, mesh):
         pass
-    
+
+    @classmethod
+    def getConflictsForNode(cls, node):
+        mesh = node.mesh
+        faces = node.faces
+        faces = cls.get(faces, mesh)
+        all_faces = np.array(cls.allFacesInMesh(mesh))
+        mask = np.in1d(all_faces, faces)
+        print("Mask", mask)
+        reduced = np.triu(cls.LookUpMatrix[mesh][np.ix_(mask, mask)])
+        res = reduced.any(axis=0)
+        print("reslult", res)
+        return np.array(faces)[res].tolist()
+        
     #
     
     def can_see(self, f2):
@@ -167,7 +196,7 @@ class ExportFace:
  
 
 local_bbox_center = None   
-def LocalBBoxCenter(obj):
+def getBBoxCenter(obj):
     if local_bbox_center:
         return local_bbox_center
     local_bbox_center = 0.125 * sum((Vector(b) for b in obj.bound_box), Vector())
@@ -202,11 +231,69 @@ def RestoreGroups(groups, mesh):
 # Nodes
 # ========================================================================================
 
+class NodeIterator:
+    """
+    For itterating the Node class objects
+    """
+    def __init__(self, node, conflict_nodes=False):
+        """
+        Goes self, 
+        """
+        self._node = node
+        # member variable to keep track of current index
+        self._index = 0
+        if type(node) == SplitNode:
+            self._checknodes = [node, node.node_behind, node.node_front]
+        else:
+            self._checknodes = [node]
+        self.conflict_nodes = conflict_nodes
+                
+             
+    def __next__(self):
+        if self._index == len(self._checknodes):
+            # End of Iteration
+            raise StopIteration
+        next = self._checknodes[self._index]
+        if isinstance(next, SplitNode) and next != self._node:
+            self._checknodes.insert(self._index+1, next.node_behind)
+            self._checknodes.insert(self._index+2, next.node_front)
+        self._index += 1
+        if self.conflict_nodes:
+            if next.hasConflicts():
+                return next
+            else:
+                return self.__next__()    
+        return next
+# ========================================================================================
+
 class Node(object):
     type = 0
     size = '<BffffH'
     
-    def __init__(self, faces, parent, sphere=None):
+    def hasConflicts(self, dump=False):
+        mat = ExportFace.LookUpMatrix[self.mesh]
+        # The upper triangle matrix (lower is 0)
+        # Which represents faces that can see ones with higher indices
+        # From there slice the rows and cols represeting the faces
+        node_conflicts = np.triu(mat)[np.ix_(self.faces, self.faces)]
+        if dump:
+            np.set_printoptions(threshold=5000, linewidth=60000)
+            disp = np.column_stack((self.faces, node_conflicts))
+            disp = np.row_stack(([np.nan]+self.faces, disp))
+            print("Conflicts in Node", self.faces,"\n",disp)
+            
+            
+        if node_conflicts.any():
+            # No conflict, no further actions necessary
+            return True
+        # Now option to try to reorder faces again or split again
+        return False
+    
+    def __init__(self, faces, parent, mesh=None, sphere=None, position=None):
+        self.parent_node = parent
+        self.sphere = sphere
+        self.position = position
+        
         if faces:
             # Faces as index not BMesh.Faces
             if (type(faces[0]) != int):
@@ -214,22 +301,36 @@ class Node(object):
             self.faces = faces
         else:
             self.faces = []
-        self.parent_node = parent
-        self.sphere = sphere
-    
-    def transform(self, n_first_faces, split_position, node_front=None, node_behind=None):
-        new = SplitNode(self.faces, n_first_faces, 
-                        parent=self.parent, 
-                        sphere=self.sphere, 
-                        node_front=None, node_behind=None)
-        if split_position == 'front':
-            self.parent.node_front = new
+
+        if mesh:
+            self.mesh = mesh
         else:
-            self.parent.node_behind = new
+            self.mesh = parent.mesh # So main needs to be initilaized with it at least.
+    
+    
+    def transform(self, n_first_faces, split_position=None, node_front=None, node_behind=None):
+        new = SplitNode(self.faces, n_first_faces, 
+                        parent=self.parent_node, 
+                        sphere=self.sphere, 
+                        node_front=None, node_behind=None,
+                        mesh=self.mesh)
+        if not split_position:
+            if self.parent_node.node_behind == self:
+                self.parent_node.node_behind = new
+            else:
+                self.parent_node.node_front = new
+        else:
+            if split_position == 'front':
+                self.parent.node_front = new
+            else:
+                self.parent.node_behind = new
         return new
-        
+     
+       
     def calcsize(self):
         return calcsize(self.size) + len(self.faces)*2
+    
+    _ignore_keys = ['position']
     
     def check(self, generation=0):
         """
@@ -240,7 +341,7 @@ class Node(object):
         ##DEBUG
         #print(self, "having", numfaces, "faces")
         for k, v in self.__dict__.items():
-            if v == None:
+            if v == None and k not in self.__class__._ignore_keys:
                 print(k, "is not set on", self, "Generation:", generation)
                 rv = False
             if k != "parent_node" and isinstance(v, Node):
@@ -252,7 +353,7 @@ class Node(object):
         self.numfaces = numfaces
         return rv
  
-    def getsphere(self, faces=None):
+    def makesphere(self):
         try:
             from ..io_scene_dark_bin import get_local_bbox_data, encode_sphere
         except ImportError:
@@ -260,8 +361,7 @@ class Node(object):
         if "sphere" in self.__dict__ and self.sphere != None:
             return self.sphere
         # Makesphere
-        if not faces:
-            print(self, "Has no faces")
+        faces = self.mesh.faces
         # Self.faces are only ints.
         self.verts = [v for idx in self.faces for v in faces[idx].verts]
         if len(self.verts) == 0:
@@ -273,7 +373,7 @@ class Node(object):
  
     def pack(self):
         return pack('<B', self.type) \
-                    + self.getsphere() \
+                    + self.makesphere() \
                     + pack('<H',len(self.faces))\
                     + b''.join(self.faces)
     
@@ -281,33 +381,20 @@ class Node(object):
         #TODO
         pass
     
+    def getConflicts(self):
+        rv = []
+        iter = NodeIterator(self, conflict_nodes=True)
+        while True:
+            try:
+                rv.append(next(iter))
+            except StopIteration:
+                break
+        return rv
+    
     def __iter__(self):
         return NodeIterator(self)
 
 
-class NodeIterator:
-    def __init__(self, node):
-        """
-        Goes self, 
-        """
-        self._node = node
-        # member variable to keep track of current index
-        self._index = 0
-        if type(node) == SplitNode:
-            self._checknodes = [node, node.node_behind, node.node_front]
-        else:
-            self._checknodes = [node]
-        
-    def __next__(self):
-        if self._index == len(self._checknodes):
-            # End of Iteration
-            raise StopIteration
-        next = self._checknodes[self._index]
-        if isinstance(next, SplitNode) and next != self._node:
-            self._checknodes.insert(self._index+1, next.node_behind)
-            self._checknodes.insert(self._index+2, next.node_front)
-        self._index += 1
-        return next
 
 class SubobjectNode(Node):
     type = 4
@@ -328,21 +415,21 @@ class SplitNode(Node):
     size = '<BffffHHfHHH'
     do_split = False
 
-    def __init__(self, faces, n_first_faces, parent, node_front=None, node_behind=None,
+    def __init__(self, faces, n_first_faces, parent, mesh=None, node_front=None, node_behind=None,
                     split_face=None, d=None, sphere=None):
         assert n_first_faces <= len(faces)
-        self.faces = faces
+        
+        super().__init__(faces, parent, mesh=mesh, sphere=sphere)
+        
         self.n_first_faces = n_first_faces
         self.node_front = node_front
         self.node_behind = node_behind
-        self.parent_node = parent
         self.d = d
-        self.sphere=sphere
         if split_face:
             makenorm(split_face)
         else:
             self.norm = None
-    
+        
     def makesimple():
         return Node(self.faces, self.parent)
 
@@ -360,7 +447,7 @@ class SplitNode(Node):
         # And/or probably later also work with the normal reversed
             self.d = pack('<f', -self.d)
         return (pack('<B', self.type)
-                + self.getsphere()
+                + self.makesphere()
                 + pack('<H', self.n_first_faces)
                 + self.norm
                 + self.d
@@ -388,6 +475,11 @@ def CalcNormal(theta, phi):
     theta = radians(90.0 - theta) # Get normal theta
     phi = radians(phi)
     return Vector([sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta)])
+
+
+
+    
+
 
 # ==============================================================================
 # Sorter
@@ -420,6 +512,11 @@ def ZDistSorter(groups, local_ZDists):
                 chosen_group_idx = i
         if not done:
             next_face = group_list[chosen_group_idx].pop(0)
+            if (next_face.index == 28
+                or next_face.index == 30
+                or next_face.index == 25
+                or next_face.index == 26):
+                print("SORTER", next_face.index, n_min)
             ordered.append(next_face.index)
             next_face.index = len(ordered) - 1 # New index
             value_list[chosen_group_idx].pop(0)
@@ -594,11 +691,16 @@ def order_normal_space(faces, groups, group_lookup, division_angles, sphere_hat=
         local_ZDists[gr_key] = []
         def pos_sort(f):
             pos = 0
+            # Both ideas vert vs. center have advantages
+            # Problem by verts is if verts are in the same plane
+            # but faces should be different.
             for v in f.verts:
                 if not pos or v.co.length > pos.length:
                     pos = v.co
+            # I would prefer verts
+            pos = f.calc_center_median()
             # n.length is not exact 1 so this is numerical, maybe round it?
-            n = round(main_normal @ pos, 5)
+            n = round(main_normal @ pos, 7)
             # Experimental scale - do further out are
             
             ##print(f.index, "main:", main_normal, "N:", n)
@@ -662,235 +764,136 @@ def order_normal_space(faces, groups, group_lookup, division_angles, sphere_hat=
     if prepare_nodes:
         # Have to redo groups as after reordering bmesh is invalid
         
-        def NodeMaker(mesh, groups, sphere_hat=True):
+        def NodeMaker(mesh, split_node=None, sphere_hat=True):
             """
             render_after and node_front belong together
             """
             ## Try to create nodes ##
-            faces = ExportFace.allFacesInMesh(mesh)
+            if split_node == None:
+                faces = ExportFace.allFacesInMesh(mesh).copy()
+            else:
+                # Select only waht's in node
+                faces = np.array(ExportFace.allFacesInMesh(mesh))[split_node.faces].tolist()
+                # Test
+                print("Test second run\n", split_node.faces)
 
-            split_groups = groups # Wanted to copy but .copy is only first level.
-            front = []  # Rendered last
+            #split_groups = groups # Wanted to copy but .copy is only first level.
             back = []   # Rendered first
             
-            """
-            # These are safe frontest and backest
-            baseNs = {}
-            for key in list(split_groups):
-                group = split_groups[key]
-                try:
-                    # This needs at least 2 faces in a group for one to be 'proper'
-                    front.append(group.pop(-1).index)
-                    back.append(group.pop(0).index)
-                    baseNs[key]=[local_ZDists[key].pop(0), local_ZDists[key].pop(-1)]
-                    if baseNs[key][0] == baseNs[key][-1]:
-                        # First and last face are in the same plane.
-                        group.reverse()
-                        front.extend([f.index for f in group])
-                        front.append(back.pop(-1))
-                        group.clear()
-                    if len(group) == 0:
-                        raise IndexError # dump it, faces were already moved to front+back
-                except IndexError:
-                    del split_groups[key]
-                    if key in local_ZDists:     # These are already reduced could throw 
-                        del local_ZDists[key]
-            
-            print("Original\n", front, back)
-            if len(split_groups) == 0:
-                print("Model was to simple for node splitting:")
-                raw = Node(faces, parent=-1)
-                if len(front) and len(back):
-                    print("Maybe could have done something")
-                raw.getsphere(faces)
-                return raw
-            
-            # Should be save to also append faces with the same n as the first.
-            both = [back, front]
-
-            for key, group in split_groups.items():
-                # Worst case baseN length is one
-                while len(local_ZDists[key]) != 0 and local_ZDists[key][0] == baseNs[key][0]:
-                    back.append(group.pop(0).index)
-                    local_ZDists[key].pop(0)
-                while len(local_ZDists[key]) != 0 and local_ZDists[key][-1] == baseNs[key][-1]:
-                    front.append(group.pop(-1).index)
-                    local_ZDists[key].pop(-1)
-            """
-            """
-            front.sort()
-            back.sort()
-            most_front = np.array(front)
-            most_back = np.array(back)
-            print(front, back)
-            
             # TODO: Where can this fuck up?
-            """
-            conflict_faces = list(ExportFace.LookUpConflicts[mesh])
-            conflict_faces.sort(key=lambda f: f.index)
-            conflict_faces_ids = [f.index for f in conflict_faces]
-            """
-            mask = np.in1d(most_front, conflict_faces_ids, assume_unique=True)
-            front_conflicts = most_front[mask]
-            front = most_front[~mask].tolist() # Remove conflict faces.
+            # For second round need to remove non present
             
-            mask = np.in1d(most_back, conflict_faces_ids, assume_unique=True)
-            back_conflicts = most_back[mask]
-            print("BACK FONCTL", back_conflicts)  
-            """
+            if split_node:
+                conflict_faces = ExportFace.getConflictsForNode(split_node)
+                # Need to add those who now are not conflicts but can be seen
+                # by ones after split.
+            else:
+                # First run
+                conflict_faces = list(ExportFace.LookUpConflicts[mesh])
+                conflict_faces.sort(key=lambda f: f.index)
+            conflict_faces_ids = [f.index for f in conflict_faces]
+            
+            print("§CONFLICTS", [f.index for f in conflict_faces], "\n max", max(conflict_faces_ids))
             
             # This should be equal to f is not seen
-            new_front = [f.index for f in faces if (f not in conflict_faces)]
-            
-            # Maybe for the future use this one:
+            # new_front = [f.index for f in faces if (f not in conflict_faces)]
+
+            # Maybe for the future use this one, are they the same?
+            # Well they can be seen if no conflict.
+            # This is not filtered after a split!
             new_front_faces = [f for f in faces if not f.is_seen()]
-            
             new_front2 = [f.index for f in new_front_faces]
-            print("Algorithms match", new_front2 == new_front)
             
-            for f in new_front_faces:
-                idx = split_groups[f.group].index(f)
-                del split_groups[f.group][idx]
-                del local_ZDists[f.group][idx]
+            new_front = []
+            new_back = []
+            checker = ExportFace.LookUpMatrix[mesh][conflict_faces_ids]
+            print(checker.shape)
+            for f in faces.copy():
+                if f.index < conflict_faces[0].index and not checker[:,f.index].any():
+                    new_front.append(f.index)
+                    faces.remove(f)
+                elif f.index > conflict_faces[-1].index:
+                    new_back.append(f.index)
+                    faces.remove(f)
             
-            for key in list(split_groups):
-                if len(split_groups[key]) == 0:
-                    del split_groups[key]
-                    if key in local_ZDists:
-                        del local_ZDists[key]
-               
+            print("Algorithms match\n", new_front2,"\n", new_front,"\n", new_back)
+            
             front = new_front
             # Removed faces are not in groups anymore, adding again below
-                  
-            
-            """
-            i = front[-1]
-            print("starting at", i)
-            while i >= 5:
-                if i not in front:
-                    print("found gap at", i)
-                    missing_face = faces[i]
-                    print("missing face", missing_face)
-                    # Option A) Fill hole
-                    # Option B) Dump Value
-                    if missing_face.index not in conflict_faces_ids and missing_face.index not in most_back:
-                        front.insert(front.index(last_valid), missing_face.index)
-                        print("inserting", missing_face.index, i+1)
-                        # Remove from split_groups
-                        split_groups[missing_face.group].remove(missing_face)
-                        local_ZDists[missing_face.group].remove(missing_face.ZDist)
-                        i += 1 # Increase by 1 to check next again.
-                else:
-                    last_valid = i
-                i -= 1
-                
-            i = back[0]
-            while i<= back_conflicts[-1]:
-                i += 1
-            # Could continue!  
-            print("new front\n", front)    
-            """
-            
-            n_first_faces = 0# len(front)
+
+            n_first_faces = len(front)
+            front.extend(new_back)
             # most_front.extend(front) # that makes no sense at the moment.
             # Create node objects
-            MainNode = SplitNode(front, n_first_faces, parent=-1)
-            BackNode = MainNode.node_behind = Node(faces=None, parent=MainNode)
-            FrontNode = MainNode.node_front = Node(faces=None, parent=MainNode)
+            if split_node:
+                MainNode = split_node.transform(n_first_faces)
+                num_all = len(split_node.faces)
+                MainNode.faces.clear()
+                MainNode.faces = front
+                print("Second frontr", front)
+                # TODO: Call nodes!
+            else:
+                MainNode = SplitNode(front, n_first_faces, parent=-1, mesh=mesh)
+            BackNode = MainNode.node_behind = Node(faces=None, parent=MainNode, position='behind')
+            FrontNode = MainNode.node_front = Node(faces=None, parent=MainNode, position='front')
             # Now need to fill these two and determine some split
             # Assuming we are sphere hat here but should work else as well
             
-            """
-            # Readd removed faces
-            for f_idx in front_conflicts:
-                f = ExportFace.get(f_idx, mesh)
-                split_groups[f.group].append(f)
-                local_ZDists[f.group].append(f.ZDist)
-            """
-            for key, group in split_groups.items():
-                print(key, [f.index for f in group])
+            # DEBUG
+            d = {}
+            for f in faces:
+                d.setdefault(f.group, []).append(f.index)
+            print(d)
             
             # DETERMINE SPLIT FACE
             print("="*30, "\nFind Split")
             
-            print("§CONFLICTS", conflict_faces_ids, "\n max", max(conflict_faces_ids))
+
             # Maybe conflict_faces[-1]?
-            """
-            if (len(division_angles[0]) // 2, 
-                len(division_angles[1]) // 2) in split_groups:      # Main +X axis
-                MainGroup = (len(division_angles[0]) // 2, len(division_angles[1]) // 2)
-            elif (len(division_angles[0]) // 2 + len(division_angles[0]) // 4,
-                  len(division_angles[1]) // 2) in split_groups:    # Main +Y Axis
-                MainGroup = (0,1)      
-            elif (0, 0) in split_groups:                            # Main +Z
-                MainGroup = (0, 0)
-            elif (0, len(division_angles[1]) -1) in split_groups:
-                MainGroup = (0, len(division_angles[1]) -1)         # Main -Z
-            else:
-                MainGroup = next(iter(split_groups.keys()))         # Anything
-            
-            group = np.array(split_groups[MainGroup], dtype="O")
-            ZDist = np.array(local_ZDists[MainGroup], dtype="O") # leave int and float
-            #del split_groups[MainGroup]
-            #del local_ZDists[MainGroup]
-            print("Main Group:", MainGroup, group)
-            print("Zs", ZDist)
 
-            behind_faces = group[ZDist<=0]
-            front_faces = group[ZDist>0]
-            print("Front Back faces")
-            print(front_faces, behind_faces)
-
-            #FrontNode.faces.extend(front)
-            # But we also need to pack ALL other faces into these groups
-            if len(front_faces):
-                split_plane_idx = front_faces[-1].index
-                split_plane = front_faces[-1]
-            else:
-                split_plane_idx = behind_faces[0].index
-                split_plane = behind_faces[0]
-            
-            split_plane = group[0]
-            """
             # Choosing a good split plane is important!
             # Maybe need to do more here - for this model it fits.
             split_plane = conflict_faces[-1]
             split_plane_idx = split_plane.index
             MainNode.split_face = split_plane.index
             
-            print("SplitPlane\n",split_plane)
+            print("SplitPlane\n",split_plane_idx)
             split_d = split_plane.calc_center_bounds() @ split_plane.normal
-            for group in split_groups.values():
-                for face in group:  # This group biased again.
-                    n = (face.calc_center_bounds() @ split_plane.normal) - split_d
-                    n = round(n, 5) # To make up some numerical unevenness close to 0.0.
-                    print(face.index, n)
-                    # This i done the other way, if in front of split plane they are behind
-                    if  n > 0:
-                        FrontNode.faces.append(face.index)
-                        print(face.index," is in front of", split_plane_idx)
-                    else:
-                        BackNode.faces.insert(0, face.index)
+            BackNode.faces.append(split_plane_idx)
+            faces.remove(split_plane)
+            for face in faces:  # This group biased again.
+                n = (face.calc_center_bounds() @ split_plane.normal) - split_d
+                n = round(n, 5) # To make up some numerical unevenness close to 0.0.
+                #print(face.index, n)
+                # This i done the other way, if in front of split plane they are behind
+                if  n >= 0:
+                    FrontNode.faces.append(face.index)
+                    print(face.index," is in front of", split_plane_idx)
+                else:
+                    BackNode.faces.insert(0, face.index)
 
             BackNode.faces.sort()
             FrontNode.faces.sort()
             #FrontNode.faces.extend([f.index for f in front_faces])
             # Is filtered internally from all faces.
-            MainNode.getsphere(faces)
-            BackNode.getsphere(faces)
-            FrontNode.getsphere(faces)
- 
+            MainNode.makesphere()
+            BackNode.makesphere()
+            FrontNode.makesphere()
  
             print("Main Faces:\n", MainNode.faces)
             print("Front Node:\n", FrontNode.faces)
             print("Back Node:\n", BackNode.faces)
             
+            print("Conflicts", MainNode.hasConflicts(), FrontNode.hasConflicts(), BackNode.hasConflicts(True))
+            
             # Makes sure all nodes in tree are set correctly
             valid = MainNode.check()
             num_faces = MainNode.numfaces
-            print("Nodes are ok?:", valid, f"\nNum Faces: {num_faces}/{len(faces)} ok?:", num_faces==len(faces))
+            if not split_node:
+                num_all = len(mesh.faces)
+            print("Nodes are ok?:", valid, f"\nNum Faces: {num_faces}/{num_all} ok?:", num_faces==num_all)
             
-            return MainNode
+            return MainNode 
 
         # End NodeMaker
         return ordered, NodeMaker
@@ -903,6 +906,7 @@ def SortByNormals(bm, divisions=4, mode='ZDist', make_nodes=True, sphere_hat=Tru
     Returns
     """
     faces = ExportFace.buildFaces(bm)
+    print("Build face", ExportFace[0])
     results = normal_filter2(bm, divisions=divisions)
     ordered, NodeMaker = order_normal_space(faces, *results, mode='ZDist', prepare_nodes=make_nodes, sphere_hat=sphere_hat)
     # Groups currently holds bmesh faces
@@ -936,7 +940,7 @@ if __name__ == "__main__":
         from DarkBinImportExport.io_scene_dark_bin import reorder_faces
         reorder_faces(bm, ordered)
         ExportFace.refresh_faces(bm) # Needs to be called, bmesh data invalid after reorder.
-        MainNode = NodeMaker(bm, groups, sphere_hat=True)
+        MainNode = NodeMaker(bm, sphere_hat=True)
         for f in MainNode.faces:
             bm.faces[f].select=True
         
@@ -951,6 +955,21 @@ if __name__ == "__main__":
         fmap.add([idx for idx in MainNode.node_front.faces])
         fmap = create_map(obj, "BehindNode")
         fmap.add([idx for idx in MainNode.node_behind.faces])
+        
+        for node in MainNode.getConflicts():
+            print("\n", "="*30,"\n")
+            print("conf node", node, node.position)
+            split_node = NodeMaker(bm, node, sphere_hat=True)
+            
+            fmap = create_map(obj, node.position+"Node_behind")
+            fmap.add([idx for idx in split_node.node_behind.faces])
+            fmap = create_map(obj, node.position+"Node_front")
+            fmap.add([idx for idx in split_node.node_front.faces])
+            # iteration is not updated
+            break
+        
+        
+
         
     bpy.ops.object.mode_set(mode='EDIT')
 

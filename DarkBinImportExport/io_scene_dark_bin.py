@@ -186,14 +186,15 @@ def prep_faces(faceBytes, version):
         face.index = f_index
         face.d = round(d,3)
         face.norm_id = norm
-        # TODO: Get rid if this:
+        # TODO: Get rid if this
+        # or better fuse with importer
         try:
+            pass
             from .testing import BinNodeExtractor
             face.normal = BinNodeExtractor.getNormalByIndex(norm)
             print("Was able to import normal")
         except Exception as e:
             print(e)
-            pass
         faces[faceAddr] = face
         faceAddr += faceEnd
         faceIndex += 1
@@ -1744,11 +1745,15 @@ def prep_subs(all_objs, materials, use_origin, sorting):
             reorder_faces(mesh, ordered)
             # Now restore groups
             SortingHelper.ExportFace.refresh_faces(mesh)
-        MainNode = NodeMaker(mesh, groups, sphere_hat=True)
+        MainNode = NodeMaker(mesh, sphere_hat=True)
         if MainNode:
             Nodes_dict[mesh] = MainNode
         else:
             Nodes_dict[mesh] = None
+        for node in MainNode.getConflicts():
+            print("conf node", node, node.position)
+            split_node = NodeMaker(mesh, node, sphere_hat=True)
+            break
 
     
     # Use custom or calced bbox
