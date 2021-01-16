@@ -93,15 +93,15 @@ if True:
     
     ##
 if False:  
-    def GetBadness(row, column):
-        badness = []
-        for i in range(len(column)):
-            badness.append(sum(row[i:]) + sum(column[:i]))
-        return np.array(badness, dtype=int)
-    
-    opt_me = np.ndarray((Res.shape), dtype=int)
-    for i in range(Res.shape[0]):
-        opt_me[:,i] = GetBadness(Res[i], Res[:,i])
+        def GetBadness(row, column):
+            badness = []
+            for i in range(len(column)):
+                badness.append(sum(row[i:]) + sum(column[:i]))
+            return np.array(badness, dtype=int)
+        
+        opt_me = np.ndarray((Res.shape), dtype=int)
+        for i in range(Res.shape[0]):
+            opt_me[:,i] = GetBadness(Res[i], Res[:,i])
     
     print("diag sum", np.sum(np.diag(opt_me)))
     

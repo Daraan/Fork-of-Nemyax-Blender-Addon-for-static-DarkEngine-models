@@ -11,8 +11,6 @@ bl_info = {
     "category": "Import-Export"
 }
 
-
-    
 import bpy
 from bpy.props import (
     StringProperty,
@@ -23,7 +21,7 @@ from bpy_extras.io_utils import (
     ImportHelper,
     path_reference_mode)
 
-
+from .testing import *
 
 from .io_scene_dark_bin import get_objs_toexport
 from importlib import reload
@@ -119,13 +117,19 @@ class ExportDarkBin(bpy.types.Operator, ExportHelper):
     sorting : EnumProperty(
         name="Sort",
         items=(
-            ("bsp","BSP","".join([
-                "May increase the polygon count unpredictably;",
-                " use only if you need transparency support"]), 'NLA', 1),
-            ("vgs","By vertex group","".join([
-                "Follow the alphabetical order of vertex group names"]), 'GROUP_VERTEX', 2),
-            ("none","Don't sort","", 'Option to sort it manually. With Mesh->Sort elements', 3),
-            ("zdist", "By normals", "Divides the faces by normals and sorts all groups from back to front." ,'NORMALS_FACE', 4)),
+            ("none", "Don't sort", 'Option to sort it manually. With Mesh->Sort elements', 0),
+            ("vgs","By vertex group", "".join([
+                "Follow the alphabetical order of vertex group names"]), 'GROUP_VERTEX', 1),
+            ("bsp","Make splits","".join([
+                "Split intersecting faces. Increases poly count!",
+                " use only if you need transparency support"]), 'MOD_BEVEL', 2),
+            ("BSP", "BSP only", 'Creates BSP tree without sorting', 'NLA', 3),
+            ("zdist", "By normals", "Divides the faces by normals and sorts all groups from back to front." ,'NORMALS_FACE', 4),
+            ("zBSP", "Normals+BSP", "Combine normal sort+BSP(recommended)" ,'MOD_NORMALEDIT', 5),
+            ("kOpt", "Best Sort", "Apply better sorting algorithm. Very slow for high poly." ,'MOD_HUE_SATURATION', 6),
+            ("fully", "Best Sort+BSP", "Combine sorter+BSP(recommended)", 'MOD_DATA_TRANSFER', 7)
+            ),
+            
         default="zdist")                                    
     use_origin : EnumProperty(
         name="Origin",
@@ -160,18 +164,35 @@ class ExportDarkBin(bpy.types.Operator, ExportHelper):
         self.layout.separator_spacer()
         self.layout.label(text="-- Objects to be exported --")
         for o in get_objs_toexport(self.export_filter):
-            self.layout.label(text=o.name) 
+            if o.name == "!TO MANY POLYGONS!":
+                self.layout.label(text=o.name, icon='ERROR')
+            else:
+                self.layout.label(text=o.name) 
     
     def execute(self, context):
         from . import io_scene_dark_bin as darkIO
         reload(darkIO)
+        # ID number for the string
+        # can deprecate that now
+        sort_to_int ={
+            "none" :0,
+            "vgs"  :1,
+            "bsp"  :2,
+            "BSP"  :3,
+            "zdist":4,
+            "zBSP" :5,
+            "kOpt" :6,
+            "fully":7,
+        }[self.sorting]
         options = {
             'clear'       :self.clear,
             'bright'      :self.bright,
             'use_origin'  :self.use_origin,
             'sorting'     :self.sorting,
             'export_filter':self.export_filter,
-            'node_texture' : self.node_texture}
+            'node_texture' : self.node_texture,
+            'opt_type'     : sort_to_int,}
+        print(options['opt_type'], "opt")
         msg, result = darkIO.do_export(self.filepath, options)
         if result == {'CANCELLED'}:
             self.report({'ERROR'}, msg)

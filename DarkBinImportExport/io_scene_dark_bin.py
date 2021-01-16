@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Dark Engine Static Model",
     "author": "nemyax",
-    "version": (0, 5, 9, 20201103), # Using YMD
+    "version": (0, 5, 10, 20201124), # Using YMD
     "blender": (2, 83, 7),
     "location": "File > Import-Export",
     "description": "Import and export Dark Engine static model .bin",
@@ -10,7 +10,6 @@ bl_info = {
     "tracker_url": "",
     "category": "Import-Export"
 }
-
 
 import bpy
 import bmesh
@@ -23,20 +22,29 @@ import glob
 from struct import pack, unpack
 
 from importlib import reload
+from .testing import *
 from .testing import SortingHelper
 reload(SortingHelper)
+from .testing import Nodes
+from .testing import BinNodeExtractor
+reload(BinNodeExtractor)
+reload(Nodes)
+Nodes.ExportFace = SortingHelper.ExportFace
+from .testing.Nodes import *
+# For development
+
 
 g_NewNodes = True
+# Each level splits into 2 nodes
+MAX_NODE_TREE_DEPTH = 4
+REL_OPT_IMPROVEMENT = 0.05
+SortingHelper.REL_OPT_IMPROVEMENT = REL_OPT_IMPROVEMENT
 
 ###
 ### Import
 ###
 
-class FaceImported:
-    binVerts   = []
-    binUVs     = []
-    binMat     = None
-    bmeshVerts = []
+from .testing.BinNodeExtractor import FaceImported # class
 
 def aka(key, l):
     result = None
@@ -333,7 +341,6 @@ def build_bmesh(bm, sub, verts):
         if mi != None:
             bmFace.material_index = sub.matSlotIndexFor(binFace.binMat)
     bm.edges.index_update()
-    print(i, bmFace, binFace.index)
     return
 
 def assign_uvs(bm, faces, uvs):
@@ -374,10 +381,15 @@ def make_mesh(subobject, verts, uvs):
 
 def parent_index(index, subobjects):
     for i in range(len(subobjects)):
-        if subobjects[i].next == index:
-            return parent_index(i, subobjects)
-        elif subobjects[i].child == index:
-            return i
+        s = subobjects[i]
+        if s.type == 'static':
+            if s.next == index:
+                return parent_index(i, subobjects)
+            elif s.child == index:
+                return i
+        else:
+            # AIMesh
+            return -1
     return -1
 
 # NEW adding bbox to new collection if enabled.
@@ -434,8 +446,10 @@ def load_img(file_path, img_name, options):
         # Problem this could be blustn.png vs blustn
         # Using material / image without extension.
         if img_noext == fbase.lower():
-            img_file = f
-            break
+            ext_found = os.path.splitext(f.lower())[1]
+            if ext_found != ".mtl": # TODO: Here we can add supported file formats - gif is handled below
+                img_file = f
+                break
     if not img_file:
         print(img_name, "not found in txt subfolders. Using empty image.")
         img = bpy.ops.image.new(name=img_name, generated_type='UV_GRID')
@@ -491,6 +505,36 @@ def create_texture(img):
     tex.use_fake_user = True
     return tex
 
+def make_face_map(obj, faces, name="NoName"):
+        if name in obj.face_maps:
+            fm = obj.face_maps[name]
+        else:
+            fm = obj.face_maps.new(name=name)
+        fm.add([f.index for f in faces])  
+
+JointNamesBiped = {
+    "LTOE":0,
+    "RTOE":1,
+    "LANKLE":2,
+    "RANKLE":3,
+    "LKNEE":4,
+    "RKNEE":5,
+    "LHIP":6,
+    "RHIP":7,
+    "BUTT":8,
+    "NECK":9,
+    "LSHLDR":10,
+    "RSHLDR":11,
+    "LELBOW":12,
+    "RELBOW":13,
+    "LWRIST":14,
+    "RWRIST":15,
+    "LFINGER":16,
+    "RFINGER":17,
+    "ABDOMEN":18,
+    "HEAD":19
+}
+
 def make_objects(object_data, file_path, options):
     bbox, subobjects, verts, uvs, mats = object_data
     objs = []
@@ -500,14 +544,30 @@ def make_objects(object_data, file_path, options):
         bpy.context.scene.collection.children.link(collection)
     else:
         collection = bpy.context.scene.collection
-   
+    
+
+    print("making objects")
+
+    
     for s in subobjects:
         mesh = make_mesh(s, verts, uvs)
         obj = bpy.data.objects.new(name=mesh.name, object_data=mesh)
-        obj.matrix_local = s.localMatrix()
+        spos = s.localMatrix()
+        if type(spos) == np.ndarray:
+            spos = mu.Matrix(spos)
+        obj.matrix_local = spos
         collection.objects.link(obj)
         
-        if (s.motion):
+        if False and s.type == "aimesh": # Use when using region subobjects
+            for smat_segment in s.region.smat_segs:
+                segment = smat_segment.segment
+                segfaces = smat_segment.faces
+                segverts = smat_segment.verts
+                name = list(JointNamesBiped.keys())[segment.joint_id]
+                make_face_map(obj, segfaces, name=name)#name=segment.joint_name)
+            
+        
+        if (s.type=="static" and s.motion): # LGMD not an AI mesh
             # For better visualization of the rotation axis
             if s.motion == 1:
                 limits = obj.constraints.new(type='LIMIT_ROTATION')
@@ -588,31 +648,35 @@ def make_objects(object_data, file_path, options):
             mat.use_nodes = True
             nodes = mat.node_tree.nodes
             # This is the main node for the interface Surface
-            shaders = nodes['Principled BSDF'].inputs
+            output_node = mat.node_tree.get_output_node('ALL')        # ['Material Output']
+            shaders = output_node.inputs[0].links[0].from_node.inputs # ['Principled BSDF'].inputs 
             
             # 0 is no alpha value => opaque => alpha = 1
-            if m[1] == 0.0:
-                shaders["Alpha"].default_value = 1.0
-            else:
-                shaders["Alpha"].default_value = m[1]
+            mat["Alpha"] = m[1] # For compatibility with NewDark Toolkit, not used in the export    
+            shaders["Alpha"].default_value = m[1] if m[1] != 0.0 else 1.0
             # For emission use nodes
             if (not shaders['Emission'].is_linked):
                 # Need a shader to RGB so it is displayed correctly
                 emissionNode = nodes.new('ShaderNodeEmission')
                 emissionNode.inputs['Strength'].default_value = m[2]
+                # Reduce color or it might not be visible
+                emissionNode.inputs['Color'].default_value = [0.02, 0.02, 0.0, 1] # dark yellow tint
+
                 converter = nodes.new('ShaderNodeShaderToRGB')
                 mat.node_tree.links.new( emissionNode.outputs['Emission'], converter.inputs['Shader'])
                 mat.node_tree.links.new( converter.outputs['Color'], shaders['Emission'])
+                
                 # Visual stuff
                 converter.hide = True
                 converter.location = [-150, -170]
                 emissionNode.location = [-350, -160]
                 emissionNode.width = 200
                 emissionNode.label = "Emission: Strength value only"
+                mat['ILLUM'] = m[2]     # For compatibility with NewDark Toolkit, not used in the export
             
             # Add image to new material
             if (not shaders["Base Color"].is_linked
-                or shaders["Base Color"].links[0].from_node.image == None): # This allows reimport after deletion
+              or shaders["Base Color"].links[0].from_node.image == None): # This allows reimport after deletion
                 if (shaders["Base Color"].is_linked):
                     texNode = shaders["Base Color"].links[0].from_node
                 else:
@@ -633,20 +697,25 @@ def make_objects(object_data, file_path, options):
         mum = parent_index(i, subobjects)
         if mum >= 0:
             objs[i].parent = objs[mum]
-    make_bbox(bbox, collection)
+    if bbox:
+        make_bbox(bbox, collection)
     return {'FINISHED'}
 
 def do_import(file_path, options):
     binData = open(file_path, 'r+b')
-    binBytes = binData.read(-1)
-    typeID = binBytes[:4]
+    typeID = binData.read(4)
+    binData.seek(0)
     if typeID == b'LGMD':
-        object_data = parse_bin(binBytes, file_path)
+        from .testing.BinNodeExtractor import parse_bin
+        object_data = parse_bin(binData)
         msg = "File \"" + file_path + "\" loaded successfully."
         result = make_objects(object_data, file_path, options)
     elif typeID == b'LGMM':
-        msg = "The Dark Engine AI mesh format is not supported."
-        result = {'CANCELLED'}
+        from .testing.BinNodeExtractor import AIMesh # class
+        object_data = AIMesh.parse_bin(binData)
+        result = make_objects(object_data, file_path, options)
+        msg = "File \"" + file_path + "\" loaded successfully."
+        #result = {'CANCELLED'}
     else:
         msg = "Cannot understand the file format."
         result = {'CANCELLED'}
@@ -662,14 +731,7 @@ re_joint = re.compile(r"@\D*(?P<number>\d+)(?P<name>.*)", re.IGNORECASE)
 # Classes
 
 class Subobject(object):
-    def __init__(self,
-        name,
-        mesh,
-        matrix,
-        motion_type,
-        motion_min,
-        motion_max,
-        vhots):
+    def __init__(self, name, mesh, matrix, motion_type, motion_min, motion_max, vhots):
         self.name        = name
         self.mesh        = mesh
         self.matrix      = matrix
@@ -810,12 +872,14 @@ class Model(object):
         # Encode materials
         mat_names = []
         if materials:
+            # Materials are filtered by used slots so they are used and not None.
             for m in materials:
-                if not m: continue
                 # Use the texture of the texture node instead of material name
-                if use_node_image:
+                if use_node_image and m.node_tree is not None:
                     image_name = None
-                    input_links = m.node_tree.nodes['Principled BSDF'].inputs["Base Color"].links
+                    output_node = m.node_tree.get_output_node('ALL')
+                    shaders = output_node.inputs[0].links[0].from_node.inputs # ['Principled BSDF'].inputs 
+                    input_links = shaders[0].links # ['Color'] or ['Base Color'] in the normal cases
                     # Input link exists
                     if (len(input_links)):
                         inputNode = input_links[0].from_node
@@ -839,18 +903,29 @@ class Model(object):
         if materials:
             aux_data_bs = b''
             for m in materials:
-                shaders = m.node_tree.nodes['Principled BSDF'].inputs
-                # Use emission node if present else use Value = max(R, G, B) as emission
-                if shaders['Emission'].is_linked:
-                    inputNode = shaders['Emission'].links[0].from_node
-                    # Rerouted via ShaderToRGB?
-                    if (inputNode.bl_idname == 'ShaderNodeShaderToRGB'):
-                        inputNode = inputNode.inputs['Shader'].links[0].from_node
-                    emission = inputNode.inputs['Strength'].default_value
+                if m.node_tree is not None:
+                    output_node = m.node_tree.get_output_node('ALL')
+                    shaders = output_node.inputs[0].links[0].from_node.inputs
+                    # Use emission node if present else use Value = max(R, G, B) as emission
+                    if 'Emission' in shaders:
+                        if shaders['Emission'].is_linked:
+                            inputNode = shaders['Emission'].links[0].from_node
+                            # Rerouted via ShaderToRGB?
+                            if (inputNode.bl_idname == 'ShaderNodeShaderToRGB'):
+                                inputNode = inputNode.inputs['Shader'].links[0].from_node
+                            emission = inputNode.inputs['Strength'].default_value
+                        else:
+                            emission = max(shaders['Emission'].default_value[:-1])
+                        # Alpha = 1 is fully visible, as is alpha = 0! Low values are more transparent.
+                        alpha = shaders["Alpha"].default_value
+                    else:
+                        print("Warning no Emission property found in the material", m.name, "Will use Custom Properties 'TRANSP' and 'ILLUM' if present.")
+                        alpha = m.get('TRANSP', 1.0)
+                        emission = m.get('ILLUM', 0.0)
                 else:
-                    emission = max(shaders["Emission"].default_value[:-1])
-                # Alpha = 1 is fully visible, as is alpha = 0! Low values are more transparent.
-                alpha = shaders["Alpha"].default_value
+                    alpha = m.get('TRANSP', 1.0)
+                    emission = m.get('ILLUM', 0.0)
+                
                 aux_data_bs += encode_floats([
                     alpha,
                     min([1.0, emission])
@@ -860,12 +935,12 @@ class Model(object):
             self.aux_data_bs = bytes(8)
         
         # Encode faces
-        face_lists = []
+        f_pgon_list = []
         faces_bs = b''
         for bm in meshes:
             ext_f = bm.faces.layers.string.active
             f_pgon_structs = [f[ext_f][14:] for f in bm.faces]
-            face_lists.append(f_pgon_structs)
+            f_pgon_list.append(f_pgon_structs)
             faces_bs += concat_bytes(f_pgon_structs)
         self.faces_bs = faces_bs
         
@@ -875,23 +950,23 @@ class Model(object):
         node_sizes  = []
         new_node_sizes = []
         addr_chunks = []
-        num_subs    = len(face_lists)
         print("="*25)
         for s in subs:
-            Nodes_dict[s.mesh].subobject = s
-            node = main_node = Nodes_dict[s.mesh]
+            node = main_node = Nodes_dict.get(s.mesh)        
+            main_node.subobject = s
             for i in range(len(s.children)):
                 print(s.name, "has children", i, "main node", type(main_node))
-                if type(main_node) == SortingHelper.Node:
-                    print("NEED TO CONVERT! TODO")
+                if type(main_node) == Node and s != root_sub:
+                    node = main_node = NodeMaker(s.mesh, split_node=main_node, max_tree_depth=MAX_NODE_TREE_DEPTH-1, opt_type=opt_type)
                 # Could use these nodes for further splits.
                 if True: # Add behind
+                    # TODO: Insert Subobject node with some logic.
                     former_behind = node.node_behind
-                    new_behind = SortingHelper.SplitNode(faces=[], n_first_faces=0, 
+                    new_behind = SplitNode(faces=[], n_first_faces=0, 
                             parent=node, node_behind=former_behind)
                     former_behind.parent_node = new_behind
-                    new_behind.node_front = SortingHelper.SubobjectNode(s.children[i].index, parent=new_behind)
-                    new_behind.d = -20.0
+                    new_behind.node_front = SubobjectNode(s.children[i].index, parent=new_behind)
+                    new_behind.d = -40.0
                     new_behind.norm = 1  # Could this be dangerous? as wrong norm. copy from parent maybe?
                     new_behind.do_split = False
                     new_behind.getsphere()
@@ -901,10 +976,10 @@ class Model(object):
                 else:
                     # in front
                     former_front = node.node_front
-                    new_front = SortingHelper.SplitNode(faces=[], n_first_faces=0, 
+                    new_front = SplitNode(faces=[], n_first_faces=0, 
                             parent=node, node_behind=former_front)
                     former_front.parent_node = new_front
-                    new_front.node_front = SortingHelper.SubobjectNode(s.children[i].index, parent=new_front)
+                    new_front.node_front = SubobjectNode(s.children[i].index, parent=new_front)
                     new_front.d = -20.0
                     new_front.norm = 0  # Could this be dangerous? as wrong norm. copy from parent maybe?
                     new_front.do_split = False
@@ -913,21 +988,26 @@ class Model(object):
                     node = new_front
 
            
-            s_pgons = face_lists[s.index]
-            node_sizes.append(precalc_node_size(s, s_pgons))
+            sub_pgons = f_pgon_list[s.index]
+            node_sizes.append(precalc_node_size(s, sub_pgons))
             
             new_node_sizes.append(3)
             for node in main_node:
                 #print("node type",type(node))
-                if type(node) != SortingHelper.SubobjectNode:
+                if type(node) != SubobjectNode:
+                    print(node, type(node), main_node)
                     new_node_sizes.append(node.calcsize())  # # order is main node -> back tree - > front trees
 
             print(sum(node_sizes),"NEw size:", sum(new_node_sizes))
             
             # Face address offsets
             ext_face_addrs = b''
-            for mds_pgon in s_pgons:
-                current_addr = pack('<H', addr)
+            for mds_pgon in sub_pgons:
+                try:
+                    current_addr = pack('<H', addr)
+                except struct.error as e:
+                    print(e, f"\nFAILURE: addr={addr} is to big. Object has to many faces.")
+                    raise
                 # This is adress, norm index and d
                 data = (current_addr, mds_pgon[6:8], mds_pgon[8:12])
                 # Key is face.index
@@ -938,17 +1018,17 @@ class Model(object):
         
         split_nodes_onparent = {}
         for idx, bm in enumerate(meshes):
-            addr_begin = unpack('<H', face_lists[idx][0][:2])[0]
+            addr_begin = unpack('<H', f_pgon_list[idx][0][:2])[0]
             for node in Nodes_dict[bm]:
-                if type(node) == SortingHelper.SubobjectNode:
+                if type(node) == SubobjectNode:
                     split_nodes_onparent[node.index] = (node.parent_node, node)
                     continue # Has no faces
                 for i in range(len(node.faces)):
-                    f_index = node.faces[i] + addr_begin
+                    f_index = node.faces[i].index + addr_begin
                     face_addr = addr_dict[f_index][0]
                     node.faces[i] = face_addr
-                if isinstance(node, SortingHelper.SplitNode) and node.norm == None:
-                    data = addr_dict[node.split_face]
+                if isinstance(node, SplitNode) and node.norm == None:
+                    data = addr_dict[node.split_face.index]
                     node.norm = data[1]
                     node.d = data[2]
                 if not node.check():
@@ -984,7 +1064,7 @@ class Model(object):
             for node in main_node:
                 s.num_nodes += 1
                 current_pos = sum(new_node_offs)
-                if type(node) != SortingHelper.SubobjectNode:
+                if type(node) != SubobjectNode:
                     node.position_offset = current_pos # See loop above.
                 if node in front_nodes_to_fill:
                     node.parent_node.node_front_off = current_pos
@@ -993,12 +1073,12 @@ class Model(object):
                 node_size = node.calcsize()
                 print("Size of current node", node_size, type(node))
                 new_node_offs.append(node_size)
-                if type(node) == SortingHelper.SplitNode:
+                if type(node) == SplitNode:
                     # Next node will start behind this one.
                     node.node_behind_off = sum(new_node_offs)
                     print("Storing", node.node_behind_off, "for behind node")
                     # Don't know how big behind tree is. Doing that when at front node.
-                    if type(node.node_front) != SortingHelper.SubobjectNode:
+                    if type(node.node_front) != SubobjectNode:
                         front_nodes_to_fill.append(node.node_front)
             
             s.node_off = main_node.position_offset - 3
@@ -1011,7 +1091,7 @@ class Model(object):
                 print("Spheres match:", sphere_bs == main_node.sphere)
                 
                 call      = s.call
-                nbf       = len(face_lists[si])
+                nbf       = len(f_pgon_list[si])
                 print("CALL IS POSITIVE")
                 if call:
                     node_bs += encode_call_node(
@@ -1050,9 +1130,10 @@ class Model(object):
                 node_bs = b''
                 node_bs += encode_sub_node(s.index) 
                 for node in Nodes_dict[s.mesh]:
-                    print(node.position_offset)
-                    if type(node) == SortingHelper.SplitNode:
-                        print(node.node_front_off, node.node_behind_off)
+                    #print(node.position_offset)
+                    if type(node) == SplitNode:
+                        pass
+                        #print(node.node_front_off, node.node_behind_off)
                     node_bs += node.pack()  
                 nodes.append(node_bs)
             
@@ -1558,6 +1639,7 @@ def get_local_bbox_data(mesh):
         (min(xs),min(ys),min(zs)),
         (max(xs),max(ys),max(zs)))
 
+
 def get_mesh(obj, materials): # and tweak materials
     mat_slot_lookup = {}
     for i in range(len(obj.material_slots)):
@@ -1571,7 +1653,8 @@ def get_mesh(obj, materials): # and tweak materials
     
     strip_wires(bm) # goodbye, box tweak hack
     uvs = bm.loops.layers.uv.verify()
-    for f in bm.faces:
+    
+    for f in [*bm.faces]: # unpack as we might add double faces
         orig_mat = f.material_index
         if orig_mat in mat_slot_lookup.keys():
             f.material_index = mat_slot_lookup[orig_mat]
@@ -1579,7 +1662,40 @@ def get_mesh(obj, materials): # and tweak materials
                 c[uvs].uv[1] = 1.0 - c[uvs].uv[1]
     return bm
 
-def append_bmesh(bm1, bm2, matrix):
+
+
+def make_face_double(bm, face, _old_verts = [], _new_verts = []):
+    uvs = bm.loops.layers.uv.verify()
+    verts = [v for v in face.verts]
+    for i, v in enumerate(verts):
+        if v in _old_verts:
+            # Found a new vert. use it again
+            verts[i] = _new_verts[_old_verts.index(v)]
+            break
+    else:
+        # no matching one found 
+        most_num = 0
+        most_idx = None
+        for i,v in enumerate(verts):
+            if len(v.link_edges) > most_num:
+                # Choose vert with most edges (so most shared)
+                most_num = len(v.link_edges)
+                most_idx = i
+        _old_verts.append(verts[most_idx])
+        # Can't create a face with same vertices need a new one.
+        # This doubled vertex is not packed -> see extend_verts
+        verts[most_idx] = bm.verts.new(verts[most_idx].co, verts[most_idx])
+        _new_verts.append(verts[most_idx])
+    
+    # In .bin we probably can do this without an extra vert but can't sort.
+    # TODO: Remove the extra vert and go back to the old.
+    f2 = bm.faces.new(verts, face)
+    f2.normal_flip()
+    for i in range(len(face.loops)):
+        f2.loops[i][uvs].uv = face.loops[-i][uvs].uv # clone UV and mirror
+
+
+def append_bmesh(bm1, bm2, matrix, materials):
     bm2.transform(matrix)
     uvs = bm1.loops.layers.uv.verify()
     uvs_orig = bm2.loops.layers.uv.verify()
@@ -1589,7 +1705,7 @@ def append_bmesh(bm1, bm2, matrix):
     for v in bm2.verts:
         bm1.verts.new(v.co)
         bm1.verts.index_update()
-    for f in bm2.faces:
+    for f in [*bm2.faces]:
         try:
             bm1.verts.ensure_lookup_table()
             bm1.faces.ensure_lookup_table()
@@ -1601,14 +1717,18 @@ def append_bmesh(bm1, bm2, matrix):
         for i in range(len(f.loops)):
             nf.loops[i][uvs].uv = f.loops[i][uvs_orig].uv
             nf.material_index = f.material_index
+        # NEW MAKE FACES DOUBLE
+        mat = materials[f.material_index]
+        if 'DBL' in mat:
+            make_face_double(bm1, nf)
         bm1.faces.index_update()
     bm2.free()
     bm1.normal_update()
 
-def combine_meshes(bms, matrices):
+def combine_meshes(bms, matrices, materials):
     result = bmesh.new()
     for bm, mtx in zip(bms, matrices):
-        append_bmesh(result, bm, mtx)
+        append_bmesh(result, bm, mtx, materials)
     return result
     
 def get_motion(obj):
@@ -1706,7 +1826,7 @@ def prep_vg_based_ordering(objs, bms):
                     mark = lookup2[lookup1[(bmi,a)]]
                     f[ord] = mark
 
-def prep_subs(all_objs, materials, use_origin, sorting):
+def prep_subs(all_objs, materials, use_origin, sorting, opt_type):
     bbox, root, gen2, gen3_plus = categorize_objs(all_objs)
     # Sort
     # Ordering by their @s__XX name in case of some extreme sub joints are wanted.
@@ -1730,31 +1850,42 @@ def prep_subs(all_objs, materials, use_origin, sorting):
     # Use object's position in blender as model origin
 
     if not use_origin == 'Custom':
-        root_mesh = combine_meshes(root_meshes, [o.matrix_world for o in root])
+        root_mesh = combine_meshes(root_meshes, [o.matrix_world for o in root], materials)
     else:
-        root_mesh = combine_meshes(root_meshes, [o.matrix_local for o in root])
+        root_mesh = combine_meshes(root_meshes, [o.matrix_local for o in root], materials)
     if sorting == 'vgs':
         do_groups(root_mesh)
    
+    # NEW SORT
     Nodes_dict = {}
     for mesh in [root_mesh] + gen2_meshes + gen3_plus_meshes:
-        ordered, groups, NodeMaker = SortingHelper.SortByNormals(mesh, mode='ZDist', make_nodes=True, sphere_hat=True)
-        if sorting == 'zdist':
+        if opt_type >= 3:
+            # Will only make faces for opt type 3
+            ordered, groups = SortingHelper.SortByNormals(mesh, mode='ZDist', sphere_hat=True, opt_type=opt_type)
             # Reordering makes faces invalid need to store only indices.
             # Reorder
-            reorder_faces(mesh, ordered)
-            # Now restore groups
-            SortingHelper.ExportFace.refresh_faces(mesh)
-        MainNode = NodeMaker(mesh, sphere_hat=True)
-        if MainNode:
-            Nodes_dict[mesh] = MainNode
+            if sorting == 'zdist': # opt_type == 4
+                reorder_faces2(mesh, ordered)
+                # Now restore groups
+                SortingHelper.ExportFace.refresh_faces(mesh, ordered)
+        if opt_type >= 3 and sorting != 'kOpt' and sorting != 'zdist': #Make BSP
+            # Make BSP
+            MainNode, ordered = NodeMaker(mesh, sphere_hat=True, max_tree_depth=MAX_NODE_TREE_DEPTH, opt_type=opt_type)
+            print(SortingHelper.WholeOptTimes)
+            print("TIMES", SortingHelper.OptTimes)
+            if ordered:
+                reorder_faces2(mesh, ordered)
+                # Now restore groups
+                SortingHelper.ExportFace.refresh_faces(mesh, ordered)
         else:
-            Nodes_dict[mesh] = None
-        for node in MainNode.getConflicts():
-            print("conf node", node, node.position)
-            split_node = NodeMaker(mesh, node, sphere_hat=True)
-            break
-
+            # Even without BSP we still need a main Node. Opt Parameters maybe for the future
+            MainNode = NodeMaker(mesh, split_node=False, max_tree_depth=MAX_NODE_TREE_DEPTH, opt_type=opt_type)
+        Nodes_dict[mesh] = MainNode
+        if False:
+            # Apply to object:
+            bpy.ops.object.mode_set(mode='OBJECT')
+            mesh.to_mesh(bpy.context.object.data)
+            bpy.context.object.data.update()
     
     # Use custom or calced bbox
     real_bbox = find_common_bbox(
@@ -1845,7 +1976,7 @@ def extend_verts(offs, bm):
     for v in bm.verts:
         xyz = v.co
         xyz_bs = pack('<3f', xyz.x, xyz.y, xyz.z)
-        v_set.add(xyz_bs)
+        v_set.add(xyz_bs) # this removes double vertices if a a face is doubled
         v[ext_v] = xyz_bs
     num_vs = len(v_set)
     v_dict = dict(zip(v_set, range(num_vs)))
@@ -1999,6 +2130,7 @@ def gather_materials(objs):
     ms = set()
     for o in objs:
         mat_indexes = set()
+        # Only take used materials
         for f in o.data.polygons:
             mat_indexes.add(f.material_index)
         slots = o.material_slots
@@ -2018,64 +2150,17 @@ class OffsetWrapper(object):
         self.f_off  = 0
 
 
-def get_objs_toexport(export_filter):
-    # Also for draw layout
-    if (export_filter == 'visible'):
-        raw_objs = bpy.context.visible_objects
-    elif (export_filter == 'selected'):
-        raw_objs = bpy.context.selected_objects
-    elif (export_filter == 'collection'):
-        # all_objects will also give objects in child collections
-        raw_objs = bpy.context.collection.all_objects
-    elif (export_filter == 'all'):
-        raw_objs = bpy.data.objects
-    else:
-        return ('ERROR: Invalid export option', {'CANCELLED'}), None  # Can not happen
-
-    # Sort alphabetically. Depending on the filter the order is not constant by default!
-    # raw_objs = sorted(raw_objs, key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else kv.name[1:].casefold())) 
-    #raw_objs = sorted(raw_objs, key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else re.search(r"\d+(.*)", kv.name, flags=re.IGNORECASE)[1]))
-    raw_objs = sorted(raw_objs, key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else re_joint.match(kv.name)['name']))
-    return [o for o in raw_objs if o.type == 'MESH']
-
-def do_export(file_path, options):
-    objs = get_objs_toexport(options['export_filter'])
-    if not objs:
-        return ("Nothing to export.",{'CANCELLED'})
-    
-    materials = gather_materials(objs)
-    root_sub, bbox, Nodes_dict = prep_subs(
-        objs,
-        materials,
-        options['use_origin'],
-        options['sorting'])
-    offs = OffsetWrapper()
-    for s in root_sub.list_subtree():
-        extend_verts(offs, s.mesh)
-        extend_loops(offs, s.mesh)
-        extend_faces(offs, s.mesh, materials)
-    model = Model(
-        root_sub,
-        materials,
-        bbox,
-        options['clear'],
-        options['bright'],
-        options['node_texture'],
-        Nodes_dict)
-    try:
-        binBytes = build_bin(model)
-        f = open(file_path, 'w+b')
-        f.write(binBytes)
-        msg = "File \"" + file_path + "\" written successfully."
-        result = {'FINISHED'}
-    except struct.error:
-        msg = "The model has too many polygons. Export cancelled.\n"
-        result = {'CANCELLED'}
-    return (msg, result)
-
 ###
 ### Sorting: common
 ###
+
+def reorder_faces2(bm, order):
+    bm.faces.ensure_lookup_table()
+    faces = bm.faces
+    for new, old in enumerate(order):
+        faces[old].index = new
+    bm.faces.sort()
+    bm.faces.ensure_lookup_table()
 
 def reorder_faces(bm, order):
     bm0 = bm.copy()
@@ -2215,3 +2300,91 @@ def split_plane(fs, bm):
 def rate(f, c):
     return (-find_d(f.normal, [(v.co - c) for v in f.verts]),-f.calc_area())
 
+def check_poly_count(objects):
+    counter = 0
+    obj_for_export = []
+    for obj in objects:
+        if obj.type != 'MESH':
+            continue
+        obj_for_export.append(obj)
+        polys = obj.data.polygons
+        for p in polys:
+            # each pgon needs 12 bytes of data + 6 per vertex + 1 for material
+            counter += 13 + len(p.vertices)*6
+            try:
+                mat = obj.material_slots[p.material_index].material
+                if "DBL" in mat:
+                    # Face will be doubled.
+                    counter += 13 + len(p.vertices)*6
+            except:
+                continue
+               
+    if counter > 0xffff: #max number that can be packed with unsigned short 4bytes.
+        # 1772 quads
+        # 2.114 tris
+        class dummy:
+            name = "!TO MANY POLYGONS!"
+        obj_for_export.append(dummy)
+    return obj_for_export
+
+
+def get_objs_toexport(export_filter):
+    # Also for draw layout
+    if (export_filter == 'visible'):
+        raw_objs = bpy.context.visible_objects
+    elif (export_filter == 'selected'):
+        raw_objs = bpy.context.selected_objects
+    elif (export_filter == 'collection'):
+        # all_objects will also give objects in child collections
+        raw_objs = bpy.context.collection.all_objects
+    elif (export_filter == 'all'):
+        raw_objs = bpy.data.objects
+    else:
+        print("ERROR: Invalid export option")
+        return None; # Can not happen
+    
+    obj_for_export = check_poly_count(raw_objs)
+    if not obj_for_export:
+        return False # To many polygons
+    
+    # Sort alphabetically. Depending on the filter the order is not constant by default!
+    # raw_objs = sorted(raw_objs, key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else kv.name[1:].casefold())) 
+    #raw_objs = sorted(raw_objs, key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else re.search(r"\d+(.*)", kv.name, flags=re.IGNORECASE)[1]))
+    obj_for_export.sort(key=lambda kv: (kv.name.casefold() if kv.name[0] != "@" else re_joint.match(kv.name)['name']))
+    return obj_for_export
+
+def do_export(file_path, options):
+    objs = get_objs_toexport(options['export_filter'])
+    if not objs:
+        return ("TO MANY POLYGONS",{'CANCELLED'})
+    
+    materials = gather_materials(objs)
+    root_sub, bbox, Nodes_dict = prep_subs(
+        objs,
+        materials,
+        options['use_origin'],
+        options['sorting'],
+        options['opt_type'])
+    offs = OffsetWrapper()
+    for s in root_sub.list_subtree():
+        extend_verts(offs, s.mesh)
+        extend_loops(offs, s.mesh)
+        extend_faces(offs, s.mesh, materials)
+    model = Model(
+        root_sub,
+        materials,
+        bbox,
+        options['clear'],
+        options['bright'],
+        options['node_texture'],
+        Nodes_dict)
+    try:
+        binBytes = build_bin(model)
+        f = open(file_path, 'w+b')
+        f.write(binBytes)
+        msg = "File \"" + file_path + "\" written successfully.\b"
+        result = {'FINISHED'}
+    except struct.error:
+        msg = "The model has too many polygons. Export cancelled.\b\n"
+        result = {'CANCELLED'}
+    return (msg, result)
